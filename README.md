@@ -2,7 +2,10 @@
 
 Kraken 现货多 + Coinbase CDE 永续空，两条腿的对冲工具。
 
-**当前阶段：只读监控 + 模拟盘，不会下任何真实订单。** 两边的 API key 都只要只读权限。
+**当前阶段：只读监控 + 模拟盘，不会下任何真实订单。** 所有 API key 都只要只读权限。
+
+现货腿可以分散在 Kraken（可质押）和 Robinhood，`account` 会把它们加总后与 CDE 空单对齐。
+Robinhood 只做持仓读取；`paper` 模拟盘的现货腿目前只按 Kraken 的订单簿成交。
 
 和 [perp-track](../perp-track) 的分工：perp-track 只看 Coinbase 那一腿，管保证金、资金费、
 强平距离以及报警；这个项目看的是**两条腿合在一起**的情况，包括是否对齐、开平一轮的成本，
@@ -13,7 +16,8 @@ Kraken 现货多 + Coinbase CDE 永续空，两条腿的对冲工具。
 ```bash
 hedge market                    # 全部标的：两边中价、基差、资金费年化、开平一轮成本、回本天数
 hedge market LTC AVAX --usd 10000
-hedge account                   # 实盘只读：Kraken 现货（含质押）vs CDE 空单，标出没对齐的
+hedge account                   # 实盘只读：现货（Kraken 含质押 + Robinhood）vs CDE 空单，标出没对齐的
+hedge rh-keygen                 # 生成 Robinhood API 密钥对（私钥写入 .env，只打印公钥）
 hedge paper open LTC --usd 2000 # 模拟：卖永续 + 买等量现货
 hedge paper close LTC --pct 50  # 模拟反向平仓：买平空单 + 卖现货
 hedge paper tick                # 记资金费，每小时跑一次

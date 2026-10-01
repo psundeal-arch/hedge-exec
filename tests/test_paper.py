@@ -151,3 +151,19 @@ def test_estimate_breakeven():
     assert e["funding_per_day"] == pytest.approx(0.0001 * 10 * 100 * 24)
     assert e["breakeven_days"] == pytest.approx(e["roundtrip"] / e["funding_per_day"])
     assert "error" in estimate(quote(), 0, Fees(0.004, 0.0025, 0.0005, 0.0002))
+
+
+def test_robinhood_signature_verifies():
+    import base64
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from hedgebot import robinhood
+    priv, pub = robinhood.keygen()
+    sig = robinhood.sign("k1", priv, 1700000000, "/api/v1/crypto/trading/holdings/", "GET")
+    # 原文 = key + 秒级时间戳 + path + method，无分隔符
+    Ed25519PublicKey.from_public_bytes(base64.b64decode(pub)).verify(
+        base64.b64decode(sig), b"k11700000000/api/v1/crypto/trading/holdings/GET")
+    # 64 字节（种子+公钥）的导出格式也能用，签名一致
+    seed = base64.b64decode(priv)
+    long = base64.b64encode(seed + base64.b64decode(pub)).decode()
+    assert robinhood.sign("k1", long, 1700000000, "/x/", "GET") == \
+        robinhood.sign("k1", priv, 1700000000, "/x/", "GET")

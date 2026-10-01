@@ -1,16 +1,17 @@
-"""实盘只读：Kraken 现货余额 vs CDE 空单，按标的对齐。"""
+"""实盘只读：现货（Kraken + Robinhood）vs CDE 空单，按标的对齐。"""
 from __future__ import annotations
 
 import os
 
-from . import coinbase, kraken
+from . import coinbase, kraken, robinhood
 from .http import SourceError
 
 
 def hedge_table(perps: dict[str, dict]) -> tuple[list[dict], list[str]]:
     """返回 (逐标的对齐行, 提示)。缺哪边凭据就跳过哪边，并在提示里说清楚。
 
-    Kraken 里质押中的币（.B/.F/.S）也计入现货多头 —— 价格风险一样，
+    spot 的构成按「场所」分：Kraken、Kraken.B（锁定质押）、Kraken.F、Robinhood…
+    Kraken 里质押中的币也计入现货多头 —— 价格风险一样，
     只是解押要等，平仓时得按 README 的顺序来。
     """
     notes: list[str] = []
@@ -20,11 +21,24 @@ def hedge_table(perps: dict[str, dict]) -> tuple[list[dict], list[str]]:
     kk, ks = os.environ.get("KRAKEN_API_KEY"), os.environ.get("KRAKEN_API_SECRET")
     if kk and ks:
         try:
-            spot = kraken.balances(kk, ks)
+            for asset, parts in kraken.balances(kk, ks).items():
+                for suffix, amt in parts.items():
+                    label = f"Kraken.{suffix}" if suffix else "Kraken"
+                    spot.setdefault(asset, {})[label] = amt
         except SourceError as e:
             notes.append(f"Kraken 余额取数失败：{e}")
     else:
         notes.append("没有 KRAKEN_API_KEY / KRAKEN_API_SECRET，跳过 Kraken（只需 Query Funds 权限）")
+
+    rk, rs = os.environ.get("RH_API_KEY"), os.environ.get("RH_PRIVATE_KEY")
+    if rk and rs:
+        try:
+            for asset, amt in robinhood.holdings(rk, rs).items():
+                spot.setdefault(asset, {})["Robinhood"] = amt
+        except SourceError as e:
+            notes.append(f"Robinhood 持仓取数失败：{e}")
+    else:
+        notes.append("没有 RH_API_KEY / RH_PRIVATE_KEY，跳过 Robinhood（hedge rh-keygen 生成）")
 
     cn, cs = os.environ.get("COINBASE_API_KEY_NAME"), os.environ.get("COINBASE_API_PRIVATE_KEY")
     if cn and cs:

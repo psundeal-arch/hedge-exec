@@ -1,7 +1,8 @@
 """hedge 命令行。
 
   hedge market [SYM ...] [--usd N]     两腿行情、基差、资金费、一轮成本与回本天数
-  hedge account                        实盘只读：Kraken 现货 vs CDE 空单是否对齐
+  hedge account                        实盘只读：现货（Kraken + Robinhood）vs CDE 空单是否对齐
+  hedge rh-keygen                      生成 Robinhood API 密钥对：私钥写进 .env，打印公钥
   hedge paper open SYM [--usd N | --contracts N]
   hedge paper close SYM [--pct P]
   hedge paper tick                     记资金费（每小时跑一次）
@@ -83,17 +84,42 @@ def cmd_account(cfg, args) -> None:
         px = r["price"]
         mismatch = abs(r["delta"]) / r["spot"] if r["spot"] > 0 else None
         bad = (r["perp"] != 0 and (mismatch is None or mismatch > cfg.hedge_tolerance))
-        parts = ", ".join(f"{k or '现货'} {v:g}" for k, v in sorted(r["spot_parts"].items()))
+        parts = ", ".join(f"{k} {v:g}" for k, v in sorted(r["spot_parts"].items()))
         out.append([r["asset"], f"{r['spot']:g}", parts or "—", f"{r['perp']:g}",
                     f"{r['delta']:+g}", _usd(r["delta"] * px if px else None),
                     _pct(mismatch, 1), "⚠ 没对齐" if bad else ""])
     if out:
-        _table(out, ["标的", "Kraken现货", "构成", "CDE(负=空)", "净delta",
+        _table(out, ["标的", "现货合计", "构成", "CDE(负=空)", "净delta",
                      "净delta美元", "偏差", ""])
     else:
         print("没有任何持仓（或两边凭据都没配）")
     for n in notes:
         print(f"  · {n}")
+
+
+# ----------------------------------------------------------------- rh-keygen
+def cmd_rh_keygen(cfg, args) -> None:
+    """私钥直接写进 .env（600），屏幕上只出现公钥 —— 私钥不经过终端回显和剪贴板。"""
+    import os
+    from .config import PROJECT_ROOT
+    from .robinhood import keygen
+    env = PROJECT_ROOT / ".env"
+    text = env.read_text() if env.exists() else ""
+    if "RH_PRIVATE_KEY=" in text and not args.force:
+        line = next(l for l in text.splitlines() if l.startswith("RH_PRIVATE_KEY="))
+        if line.split("=", 1)[1].strip():
+            sys.exit(".env 里已有 RH_PRIVATE_KEY。要换新的加 --force"
+                     "（旧 key 在 Robinhood 上记得删掉）")
+    priv, pub = keygen()
+    lines = [l for l in text.splitlines() if not l.startswith("RH_PRIVATE_KEY=")]
+    if not any(l.startswith("RH_API_KEY=") for l in lines):
+        lines.append("RH_API_KEY=")
+    lines.append(f"RH_PRIVATE_KEY={priv}")
+    env.write_text("\n".join(lines) + "\n")
+    os.chmod(env, 0o600)
+    print("私钥已写入 .env（600 权限）。把下面这个【公钥】贴到 Robinhood：\n")
+    print(f"    {pub}\n")
+    print("Robinhood 生成 key 后，把它给你的 API key 填进 .env 的 RH_API_KEY=")
 
 
 # ----------------------------------------------------------------- paper
@@ -192,6 +218,8 @@ def main(argv=None) -> None:
     m.add_argument("symbols", nargs="*")
     m.add_argument("--usd", type=float)
     sub.add_parser("account", help="实盘只读对齐检查")
+    k = sub.add_parser("rh-keygen", help="生成 Robinhood API 密钥对")
+    k.add_argument("--force", action="store_true")
     p = sub.add_parser("paper", help="模拟盘")
     ps = p.add_subparsers(dest="action", required=True)
     o = ps.add_parser("open")
@@ -210,7 +238,8 @@ def main(argv=None) -> None:
 
     load_env()
     cfg = load_config()
-    {"market": cmd_market, "account": cmd_account, "paper": cmd_paper}[args.cmd](cfg, args)
+    {"market": cmd_market, "account": cmd_account, "rh-keygen": cmd_rh_keygen,
+     "paper": cmd_paper}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":
