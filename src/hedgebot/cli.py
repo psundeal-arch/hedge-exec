@@ -5,6 +5,7 @@
   hedge live open|close SYM --spot coinbase|kraken [--usd N | --contracts N] [--paper | --go]
                                        开平仓：现货挂单 + 空单按成交跟进。默认只预检，
                                        --paper 模拟执行，--go 真实下单
+  hedge scan [SYM ...] [--perp-track] [--paper]   批量体检；--paper 逐个模拟实跑开+平
   hedge watch [--dry-run]              巡检：对齐报警 + 模拟盘记资金费（timer 每 15 分钟跑）
   hedge import-cb-key ~/Downloads/xxx.json   导入 Coinbase 交易 key 到 .env.trade
   hedge rh-keygen                      生成 Robinhood API 密钥对：私钥写进 .env，打印公钥
@@ -17,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import sys
 
 from . import coinbase
@@ -100,6 +102,84 @@ def cmd_account(cfg, args) -> None:
         print("  ↑ 有来源没读到，上表的对齐结果不可信")
     for n in notes:
         print(f"  · {n}")
+
+
+# ----------------------------------------------------------------- scan
+PERP_TRACK = Path.home() / "git" / "perp-track"
+
+
+def cmd_scan(cfg, args) -> None:
+    import csv
+    import datetime as dt
+    import json
+    import tomllib
+    from .scan import paper_sweep, static_scan
+    syms = [s.upper() for s in args.symbols]
+    if args.perp_track:
+        with open(PERP_TRACK / "config.toml", "rb") as f:
+            syms += tomllib.load(f)["perp"]["funding_underlyings"]
+    if not syms:
+        syms = sorted(coinbase.cde_perps())
+    syms = list(dict.fromkeys(syms))
+    db = Path(args.funding_db).expanduser() if args.funding_db else PERP_TRACK / "perp.db"
+    rows = static_scan(cfg, syms, db)
+    ok = [r for r in rows if "product" in r]
+    ok.sort(key=lambda r: -(r["capital_apy"] or -99))
+    print(f"资金费均值来自 {db}（{'有' if any(r.get('n24') for r in ok) else '无'} 24h 样本）；"
+          f"一块 = ≤${cfg.live.clip_usd:,.0f}，成本 = 现货挂单×2 + CDE 吃单×2 + 每张固定费 + CDE 半价差×2\n")
+    _table([[r["symbol"], f"${r['per_contract']:,.0f}", r["clip_n"],
+             f"{r['spot_spread_bp']:.1f}", f"{r['perp_spread_bp']:.1f}",
+             f"${r['perp_depth_usd'] / 1000:,.0f}K", f"{r['basis_bp']:+.1f}",
+             f"{r['apr_now']:.1f}%", "—" if r["apr_24h"] is None else f"{r['apr_24h']:.1f}%",
+             "—" if r["apr_7d"] is None else f"{r['apr_7d']:.1f}%",
+             f"{r['margin'] * 100:.0f}%", f"{r['capital_apy']:.1f}%",
+             f"{r['cost_pct']:.2f}%", "—" if r["breakeven_d"] is None else f"{r['breakeven_d']:.1f}",
+             f"${r['oi_usd'] / 1e6:,.1f}M", "，".join(r["flags"])] for r in ok],
+           ["标的", "每张", "块张数", "现货价差bp", "CDE价差bp", "CDE深度30bp", "基差bp",
+            "费率当前", "24h均", "7d均", "空单保证金", "资本年化", "一轮成本", "回本天",
+            "OI", "提示"])
+    print("\n资本年化 = 24h 均费率 ÷ (1 + 空单隔夜保证金率)：现货全额 + 空单保证金都算占用。")
+    skipped: dict[str, list[str]] = {}
+    for r in rows:
+        if "product" not in r:
+            skipped.setdefault("，".join(r["flags"]), []).append(r["symbol"])
+    for why, ss in skipped.items():
+        print(f"  跳过 {len(ss)} 个（{why}）：{' '.join(ss)}")
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")
+    out = cfg.db_path.parent / f"scan-{stamp}.csv"
+    keys = [k for k in ok[0] if k != "flags"] + ["flags"] if ok else []
+    with open(out, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=keys)
+        w.writeheader()
+        for r in ok:
+            w.writerow({**r, "flags": "；".join(r["flags"])})
+    print(f"\n已存 {out}")
+
+    if not args.paper:
+        return
+    todo = [r["symbol"] for r in ok if not any(
+        f in ("闭市", "基差 >1%（单位不对？）") for f in r["flags"])]
+    print(f"\n模拟实跑 {len(todo)} 个（每个开一块再平掉，挂单最多等 {args.max_wait:g} 秒）：")
+    res = paper_sweep(cfg, todo, max_wait=args.max_wait)
+    rows2 = []
+    for r in res:
+        o, c = r.get("open") or {}, r.get("close") or {}
+        rows2.append([r["symbol"], r.get("contracts", "—"),
+                      f"{o.get('status', '—')}/{c.get('status', '—')}",
+                      f"{o.get('secs', 0):.0f}+{c.get('secs', 0):.0f}s",
+                      f"{o.get('orders', 0)}+{c.get('orders', 0)}",
+                      "补" if o.get("taker_finish") or c.get("taker_finish") else "",
+                      "—" if o.get("basis_bp") is None else f"{o['basis_bp']:+.1f}",
+                      "—" if c.get("basis_bp") is None else f"{c['basis_bp']:+.1f}",
+                      "—" if r.get("cost_bp") is None else f"{r['cost_bp']:.1f}",
+                      f"${max(o.get('max_unhedged_usd', 0), c.get('max_unhedged_usd', 0)):,.0f}",
+                      r.get("error", "")])
+    print()
+    _table(rows2, ["标的", "张", "开/平", "耗时", "挂单次数", "超时补齐", "开基差bp", "平基差bp",
+                   "实际一轮成本bp", "最大裸敞口", "错误"])
+    print("\n实际一轮成本 = (两轮手续费) ÷ 名义 − 基差收益（开仓基差 − 平仓基差）。"
+          "模拟挂单成交偏乐观（不考虑同价排队）。")
+    (cfg.db_path.parent / f"sweep-{stamp}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1))
 
 
 # ----------------------------------------------------------------- watch
@@ -284,6 +364,12 @@ def main(argv=None) -> None:
     m.add_argument("--go", action="store_true", help="真实下单（会要求手输确认）")
     m.add_argument("--paper", action="store_true",
                    help="模拟执行：盯真实行情、同一套引擎，成交记入模拟盘")
+    sc = sub.add_parser("scan", help="批量体检：哪些标的适合 Coinbase 现货 + CDE 空单")
+    sc.add_argument("symbols", nargs="*")
+    sc.add_argument("--perp-track", action="store_true", help="加上 perp-track 的观察名单")
+    sc.add_argument("--funding-db", help="资金费历史库（默认 ~/git/perp-track/perp.db）")
+    sc.add_argument("--paper", action="store_true", help="逐个模拟实跑开+平")
+    sc.add_argument("--max-wait", type=float, default=90)
     w = sub.add_parser("watch", help="巡检与报警")
     w.add_argument("--dry-run", action="store_true", help="只打印，不发通知、不改状态")
     w.add_argument("--test-notify", action="store_true", help="只发一条测试通知")
@@ -309,7 +395,7 @@ def main(argv=None) -> None:
 
     load_env()
     cfg = load_config()
-    {"market": cmd_market, "account": cmd_account, "watch": cmd_watch,
+    {"market": cmd_market, "account": cmd_account, "watch": cmd_watch, "scan": cmd_scan,
      "live": lambda c, a: __import__("hedgebot.live", fromlist=["execute"]).execute(c, a),
      "rh-keygen": cmd_rh_keygen, "import-cb-key": cmd_import_cb_key,
      "paper": cmd_paper}[args.cmd](cfg, args)
