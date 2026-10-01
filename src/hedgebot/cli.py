@@ -2,9 +2,11 @@
 
   hedge market [SYM ...] [--usd N]     两腿行情、基差、资金费、一轮成本与回本天数
   hedge account                        实盘只读：现货（Kraken + Robinhood）vs CDE 空单是否对齐
-  hedge live open|close SYM --spot coinbase|kraken [--usd N | --contracts N] [--go]
-                                       真实开平仓：现货挂单 + 空单按成交跟进。不加 --go 只预检
+  hedge live open|close SYM --spot coinbase|kraken [--usd N | --contracts N] [--paper | --go]
+                                       开平仓：现货挂单 + 空单按成交跟进。默认只预检，
+                                       --paper 模拟执行，--go 真实下单
   hedge watch [--dry-run]              巡检：对齐报警 + 模拟盘记资金费（timer 每 15 分钟跑）
+  hedge import-cb-key ~/Downloads/xxx.json   导入 Coinbase 交易 key 到 .env.trade
   hedge rh-keygen                      生成 Robinhood API 密钥对：私钥写进 .env，打印公钥
   hedge paper open SYM [--usd N | --contracts N]
   hedge paper close SYM [--pct P]
@@ -116,6 +118,34 @@ def cmd_watch(cfg, args) -> None:
             cmd_paper(cfg, argparse.Namespace(action="tick"))
         except Exception as e:      # noqa: BLE001
             print(f"模拟盘 tick 失败：{e}")
+
+
+# ----------------------------------------------------------------- import-cb-key
+def cmd_import_cb_key(cfg, args) -> None:
+    """把 Coinbase 下载的 key JSON 写进 .env.trade（600）。私钥不经过屏幕和剪贴板。"""
+    import base64
+    import json
+    import os
+    from .config import PROJECT_ROOT
+    raw = json.loads(open(os.path.expanduser(args.path)).read())
+    name = raw.get("name") or raw.get("id")
+    secret = raw.get("privateKey")
+    if not (name and secret):
+        sys.exit(f"JSON 里没有 name/id 与 privateKey（键：{', '.join(raw)}）")
+    try:
+        n = len(base64.b64decode(secret))
+    except ValueError:
+        n = -1
+    if n != 64:
+        sys.exit(f"privateKey 不是 Ed25519 格式（解码 {n} 字节，应为 64）—— 创建时要选 Ed25519")
+    env = PROJECT_ROOT / ".env.trade"
+    lines = [l for l in (env.read_text().splitlines() if env.exists() else [])
+             if not l.startswith(("COINBASE_TRADE_KEY_NAME=", "COINBASE_TRADE_PRIVATE_KEY="))]
+    lines += [f"COINBASE_TRADE_KEY_NAME={name}", f"COINBASE_TRADE_PRIVATE_KEY={secret}"]
+    env.write_text("\n".join(lines) + "\n")
+    os.chmod(env, 0o600)
+    print(f"已写入 {env}（600）。key：{name[:24]}…")
+    print(f"确认能用之后可以删掉下载的文件：rm {args.path}")
 
 
 # ----------------------------------------------------------------- rh-keygen
@@ -250,10 +280,15 @@ def main(argv=None) -> None:
     lv.add_argument("--finish", choices=["complete", "trim"], default="complete",
                     help="挂单超时后：complete 吃单补齐（默认）/ trim 退掉凑不满一张的零头")
     lv.add_argument("--max-wait", type=float, help="挂单最多等多少秒（默认见 config）")
-    lv.add_argument("--go", action="store_true", help="真实下单（会要求手输确认）")
+    m = lv.add_mutually_exclusive_group()
+    m.add_argument("--go", action="store_true", help="真实下单（会要求手输确认）")
+    m.add_argument("--paper", action="store_true",
+                   help="模拟执行：盯真实行情、同一套引擎，成交记入模拟盘")
     w = sub.add_parser("watch", help="巡检与报警")
     w.add_argument("--dry-run", action="store_true", help="只打印，不发通知、不改状态")
     w.add_argument("--test-notify", action="store_true", help="只发一条测试通知")
+    ik = sub.add_parser("import-cb-key", help="导入 Coinbase 交易 key 的 JSON 到 .env.trade")
+    ik.add_argument("path")
     k = sub.add_parser("rh-keygen", help="生成 Robinhood API 密钥对")
     k.add_argument("--force", action="store_true")
     p = sub.add_parser("paper", help="模拟盘")
@@ -276,7 +311,7 @@ def main(argv=None) -> None:
     cfg = load_config()
     {"market": cmd_market, "account": cmd_account, "watch": cmd_watch,
      "live": lambda c, a: __import__("hedgebot.live", fromlist=["execute"]).execute(c, a),
-     "rh-keygen": cmd_rh_keygen,
+     "rh-keygen": cmd_rh_keygen, "import-cb-key": cmd_import_cb_key,
      "paper": cmd_paper}[args.cmd](cfg, args)
 
 

@@ -1,4 +1,5 @@
-"""hedge live：真实开/平仓。默认只预检；--go 才下单，且要在终端里手输确认。
+"""hedge live：开/平仓。默认只预检；--go 真实下单（终端手输确认）；
+--paper 盯真实行情模拟下单，执行引擎与 --go 完全相同，成交记入模拟盘。
 
 交易 key 放在 .env.trade（只留本机，deploy 不会带上服务器）：
     COINBASE_TRADE_KEY_NAME / COINBASE_TRADE_PRIVATE_KEY   现货 + CDE 下单
@@ -17,6 +18,7 @@ from . import coinbase
 from .config import PROJECT_ROOT, Config, load_env
 from .http import SourceError
 from .ladder import Ladder, Params
+from .paper_legs import PaperPerpLeg, PaperSpotLeg, coinbase_trades, kraken_trades
 from .trade_api import (CoinbaseLeg, KrakenLeg, _CoinbaseAuth, _KrakenAuth,
                         coinbase_available, kraken_available)
 
@@ -58,12 +60,17 @@ def trade_auths(spot_venue: str, *, need_trade: bool):
     return (_CoinbaseAuth(*cb), _KrakenAuth(*kr) if kr else None, notes)
 
 
-def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool):
+def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool, paper: bool = False):
     perps = coinbase.cde_perps()
     p = perps.get(symbol)
     if not p:
         raise SystemExit(f"CDE 没有 {symbol} 的永续")
-    cb_auth, kr_auth, notes = trade_auths(spot_venue, need_trade=need_trade)
+    if paper:
+        # 模拟不碰任何账户：腿的构造只读公开的合约规格，不需要 key
+        cb_auth = kr_auth = None
+        notes = ["模拟盘：盯真实行情、不下真实订单，成交记入模拟盘（hedge paper status）"]
+    else:
+        cb_auth, kr_auth, notes = trade_auths(spot_venue, need_trade=need_trade)
     perp = CoinbaseLeg(cb_auth, p["product_id"], is_perp=True)
     if spot_venue == "coinbase":
         spot = CoinbaseLeg(cb_auth, f"{symbol}-USD", is_perp=False)
@@ -76,13 +83,26 @@ def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool):
         spot = KrakenLeg(kr_auth, pair)
         avail = lambda: kraken_available(kr_auth)              # noqa: E731
         maker = cfg.fees.kraken_maker
+    if paper:
+        f = cfg.fees
+        taker = f.coinbase_taker if spot_venue == "coinbase" else f.kraken_taker
+        # 先把代码绑定下来 —— 下一行 spot 就被换成模拟腿了，闭包里不能再引用它
+        ident = spot.product_id if spot_venue == "coinbase" else spot.pair
+        trades = ((lambda: coinbase_trades(ident)) if spot_venue == "coinbase"
+                  else (lambda: kraken_trades(ident)))
+        spot = PaperSpotLeg(spot, maker_fee=maker, taker_fee=taker, trades_fn=trades)
+        perp = PaperPerpLeg(perp, contract_size=p["contract_size"], taker_fee=f.cde_taker,
+                            per_contract=f.cde_per_contract)
+        avail = None
     return p, spot, perp, cb_auth, avail, maker, notes
 
 
 def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
     """所有能在下单前查的都查一遍。返回计划；有致命问题时 plan['blockers'] 非空。"""
     sym = args.symbol.upper()
-    p, spot, perp, cb_auth, avail, maker, notes = build(cfg, sym, args.spot, need_trade=need_trade)
+    paper = getattr(args, "paper", False)
+    p, spot, perp, cb_auth, avail, maker, notes = build(cfg, sym, args.spot,
+                                                        need_trade=need_trade, paper=paper)
     cs = p["contract_size"]
     pb, sb = perp.book(), spot.book()
     if not (pb.mid and sb.mid):
@@ -102,66 +122,75 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
     if qty < spot.min_qty:
         blockers.append(f"现货 {qty:g} 低于最小下单量 {spot.min_qty:g}")
 
-    try:
-        bal = avail()
-    except SourceError as e:
-        bal = None
-        blockers.append(f"读不到 {args.spot} 余额：{e}")
-    if bal is not None:
-        if args.action == "open":
-            cash = bal.get("USD", 0) + (bal.get("USDC", 0) if args.spot == "coinbase" else 0)
-            need = notional * (1 + maker) * 1.01
-            if cash < need:
-                blockers.append(f"{args.spot} 可用美元 ${cash:,.2f} < 需要 ${need:,.2f}")
-        else:
-            have = bal.get(sym, 0)
-            if have < qty:
-                blockers.append(f"{args.spot} 可卖 {sym} {have:g} < 要卖 {qty:g}"
-                                f"（Kraken 质押中的不能直接卖，要先解押）")
-
-    # CDE 保证金。只有现金（USD/USDC）计入，【加密现货不算】—— 无论币在 Coinbase
-    # 还是 Kraken。所以在 Coinbase 用 USD 买现货，花掉的那笔钱会直接从 CDE 的
-    # 购买力里扣掉；空单再要一份保证金。按隔夜（更高的那档）保证金率算。
-    if args.action == "open":
-        try:
-            bs = cb_auth.call("GET", "/api/v3/brokerage/cfm/balance_summary",
-                              "CDE 保证金")["balance_summary"]
-            bp = float((bs.get("futures_buying_power") or {}).get("value") or 0)
-            rate = p["margin_short_overnight"] or 0
-            spend = notional if args.spot == "coinbase" else 0.0
-            need = spend + notional * rate
-            warns.append(f"CDE 购买力 ${bp:,.0f}，本笔占用约 ${need:,.0f}"
-                         + (f"（含 Coinbase 买现货花掉的 ${spend:,.0f} 现金）" if spend else ""))
-            if bp < need:
-                blockers.append(
-                    f"CDE 购买力 ${bp:,.0f} < 需要 ${need:,.0f}"
-                    + (f"（Coinbase 买现货花掉 ${spend:,.0f} 现金" if spend else "（")
-                    + f"{' + ' if spend else ''}空单隔夜保证金 {rate*100:.1f}% × ${notional:,.0f}）")
-            elif bp - need < notional * 0.3:
-                warns.append(f"开仓后 CDE 购买力只剩约 ${bp - need:,.0f}，币价上涨 30% 左右就可能"
-                             f"追加保证金 —— 看 perp-track 的强平距离")
-        except SourceError as e:
-            blockers.append(f"读不到 CDE 保证金：{e}")
-
-    if args.action == "close":
-        try:
-            held = sum(r["contracts"] for r in coinbase.positions(cb_auth.key_name, cb_auth.key_secret)
-                       if r["product"] == p["product_id"] and r["side"] == "SHORT")
-            if held < contracts:
-                blockers.append(f"CDE 只有 {held:g} 张空单，要平 {contracts}")
-        except SourceError as e:
-            blockers.append(f"读不到 CDE 持仓：{e}")
-
     previews = {}
-    for name, leg, side, n in (("CDE", perp, "sell" if args.action == "open" else "buy", contracts),
-                               ("现货", spot, "buy" if args.action == "open" else "sell", qty)):
+    bal = None
+    if paper and args.action == "close":
+        from .paper import Paper
+        pos = Paper(cfg).position(sym)
+        held = -pos["contracts"] if pos else 0
+        if held < contracts or not pos or pos["spot_qty"] < qty - 1e-9:
+            blockers.append(f"模拟盘里 {sym} 只有 {held:g} 张空单 / "
+                            f"{pos['spot_qty'] if pos else 0:g} 现货，不够平 {contracts} 张")
+    if not paper:
         try:
-            pv = leg.preview(side, n)
-            previews[name] = pv
-            if not pv["ok"]:
-                (blockers if need_trade else warns).append(f"{name} 预检未通过：{pv['errors']}")
+            bal = avail()
         except SourceError as e:
-            (blockers if need_trade else warns).append(f"{name} 预检请求失败：{e}")
+            bal = None
+            blockers.append(f"读不到 {args.spot} 余额：{e}")
+        if bal is not None:
+            if args.action == "open":
+                cash = bal.get("USD", 0) + (bal.get("USDC", 0) if args.spot == "coinbase" else 0)
+                need = notional * (1 + maker) * 1.01
+                if cash < need:
+                    blockers.append(f"{args.spot} 可用美元 ${cash:,.2f} < 需要 ${need:,.2f}")
+            else:
+                have = bal.get(sym, 0)
+                if have < qty:
+                    blockers.append(f"{args.spot} 可卖 {sym} {have:g} < 要卖 {qty:g}"
+                                    f"（Kraken 质押中的不能直接卖，要先解押）")
+
+        # CDE 保证金。只有现金（USD/USDC）计入，【加密现货不算】—— 无论币在 Coinbase
+        # 还是 Kraken。所以在 Coinbase 用 USD 买现货，花掉的那笔钱会直接从 CDE 的
+        # 购买力里扣掉；空单再要一份保证金。按隔夜（更高的那档）保证金率算。
+        if args.action == "open":
+            try:
+                bs = cb_auth.call("GET", "/api/v3/brokerage/cfm/balance_summary",
+                                  "CDE 保证金")["balance_summary"]
+                bp = float((bs.get("futures_buying_power") or {}).get("value") or 0)
+                rate = p["margin_short_overnight"] or 0
+                spend = notional if args.spot == "coinbase" else 0.0
+                need = spend + notional * rate
+                warns.append(f"CDE 购买力 ${bp:,.0f}，本笔占用约 ${need:,.0f}"
+                             + (f"（含 Coinbase 买现货花掉的 ${spend:,.0f} 现金）" if spend else ""))
+                if bp < need:
+                    blockers.append(
+                        f"CDE 购买力 ${bp:,.0f} < 需要 ${need:,.0f}"
+                        + (f"（Coinbase 买现货花掉 ${spend:,.0f} 现金" if spend else "（")
+                        + f"{' + ' if spend else ''}空单隔夜保证金 {rate*100:.1f}% × ${notional:,.0f}）")
+                elif bp - need < notional * 0.3:
+                    warns.append(f"开仓后 CDE 购买力只剩约 ${bp - need:,.0f}，币价上涨 30% 左右就可能"
+                                 f"追加保证金 —— 看 perp-track 的强平距离")
+            except SourceError as e:
+                blockers.append(f"读不到 CDE 保证金：{e}")
+
+        if args.action == "close":
+            try:
+                held = sum(r["contracts"] for r in coinbase.positions(cb_auth.key_name, cb_auth.key_secret)
+                           if r["product"] == p["product_id"] and r["side"] == "SHORT")
+                if held < contracts:
+                    blockers.append(f"CDE 只有 {held:g} 张空单，要平 {contracts}")
+            except SourceError as e:
+                blockers.append(f"读不到 CDE 持仓：{e}")
+
+        for name, leg, side, n in (("CDE", perp, "sell" if args.action == "open" else "buy", contracts),
+                                   ("现货", spot, "buy" if args.action == "open" else "sell", qty)):
+            try:
+                pv = leg.preview(side, n)
+                previews[name] = pv
+                if not pv["ok"]:
+                    (blockers if need_trade else warns).append(f"{name} 预检未通过：{pv['errors']}")
+            except SourceError as e:
+                (blockers if need_trade else warns).append(f"{name} 预检请求失败：{e}")
 
     f = cfg.fees
     spot_fee = notional * maker
@@ -194,26 +223,50 @@ def print_plan(plan: dict, args) -> None:
 
 
 def execute(cfg: Config, args) -> None:
+    paper = args.paper
     plan = preflight(cfg, args, need_trade=args.go)
     print_plan(plan, args)
     if plan["blockers"]:
         sys.exit("\n有阻断项，不下单。")
+    if paper:
+        return _run(cfg, args, plan, mode="paper")
     if not args.go:
-        print("\n以上是预检，没有下单。确认无误后加 --go 真实执行。")
+        print("\n以上是预检，没有下单。确认无误后加 --go 真实执行，或加 --paper 模拟执行。")
         return
     if not sys.stdin.isatty():
         sys.exit("真实下单必须在终端里手动确认，不接受管道/脚本输入")
     want = f"{plan['symbol']} {plan['contracts']}"
     if input(f"\n真实下单。确认请输入「{want}」：").strip() != want:
         sys.exit("没确认，不下单")
+    _run(cfg, args, plan, mode="live")
 
+
+def _run(cfg: Config, args, plan: dict, *, mode: str) -> None:
     db = sqlite3.connect(cfg.db_path.parent / "live.db")
     db.executescript(SCHEMA)
+    try:
+        db.execute("alter table runs add column mode text")
+    except sqlite3.OperationalError:
+        pass                                        # 已经有这一列
     now = lambda: dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")  # noqa: E731
-    run_id = db.execute("insert into runs(started,symbol,action,spot_venue,contracts,status)"
-                        " values(?,?,?,?,?,?)", (now(), plan["symbol"], args.action, args.spot,
-                                                 plan["contracts"], "running")).lastrowid
+    run_id = db.execute("insert into runs(started,symbol,action,spot_venue,contracts,status,mode)"
+                        " values(?,?,?,?,?,?,?)", (now(), plan["symbol"], args.action, args.spot,
+                                                   plan["contracts"], "running", mode)).lastrowid
     db.commit()
+
+    # 模拟成交同时记进模拟盘，这样 paper status 能看到仓位、watch 会按整点记资金费
+    pp = q = None
+    if mode == "paper":
+        from .executor import Fill
+        from .market import fetch_quotes
+        from .paper import Paper
+        pp = Paper(cfg)
+        quotes, skipped = fetch_quotes(cfg, [plan["symbol"]])
+        if quotes:
+            q = quotes[0]
+            pp.accrue(q)                            # 先结清旧仓位的资金费，再改仓位
+        else:
+            print(f"  · 模拟盘记账跳过（{'；'.join(skipped)}），成交只记 live.db")
 
     def on_fill(**f):
         # 每笔成交立刻落盘 —— 进程中途死掉也能知道到底成交了什么
@@ -221,6 +274,10 @@ def execute(cfg: Config, args) -> None:
                    " values(?,?,?,?,?,?,?,?,?)", (run_id, now(), f["venue"], f["side"], f["qty"],
                                                   f["price"], f["fee"], f["order_id"], f["kind"]))
         db.commit()
+        if pp and q:
+            pp._record(q, f"live-{args.action}", [Fill(f["venue"], f["side"], f["qty"], f["price"],
+                                                       f["fee"], now())],
+                       dt.datetime.now(dt.timezone.utc).replace(microsecond=0))
 
     spot, perp = plan["legs"]
     lv = cfg.live
@@ -240,7 +297,7 @@ def execute(cfg: Config, args) -> None:
                (now(), r.status, json.dumps(summary), run_id))
     db.commit()
 
-    print(f"\n结果：{r.status}")
+    print(f"\n结果：{r.status}{'（模拟）' if mode == 'paper' else ''}")
     print(f"  现货 {r.spot_qty:g} @ {r.spot_avg or 0:g}，手续费 ${r.spot_fees:.2f}，挂单 {r.spot_orders} 次")
     if r.contracts:
         print(f"  CDE {r.contracts} 张 @ {summary['perp_avg']:g}，手续费 ${r.perp_fees:.2f}")
@@ -249,4 +306,4 @@ def execute(cfg: Config, args) -> None:
         print(f"  ⚠ 未对冲零头 {resid:+g} {plan['symbol']}（≈ ${abs(resid) * plan['spot_mid']:,.0f}）")
     if r.status == "aborted":
         print("  ✗ 空单没跟上，现货已成交部分是裸腿 —— 去 CDE 手动补，或在现货平台卖掉")
-    print("  核对两边：hedge account")
+    print("  看模拟仓位：hedge paper status" if mode == "paper" else "  核对两边：hedge account")

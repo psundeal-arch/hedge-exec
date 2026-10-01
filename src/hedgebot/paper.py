@@ -103,7 +103,7 @@ class Paper:
             "opened_at": now.isoformat(), "funding_from": None}
         for f in fills:
             sign = 1 if f.side == "buy" else -1
-            if f.venue == "kraken":
+            if f.venue != "cde":                 # 现货腿：kraken 或 coinbase
                 pos["spot_qty"], pos["spot_avg"], r = apply_fill(
                     pos["spot_qty"], pos["spot_avg"], sign * f.qty, f.price, 1.0)
                 pos["spot_qty"] = round(pos["spot_qty"], 10)    # 消掉浮点尘埃
