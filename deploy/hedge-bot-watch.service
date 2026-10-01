@@ -1,0 +1,15 @@
+[Unit]
+Description=hedge-bot watch（两腿对齐报警 + 模拟盘记资金费）
+After=network-online.target
+Wants=network-online.target
+OnFailure=hedge-bot-failed.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/hedge-bot
+# 通知凭据（Discord / Pushover）与 perp-track 共用，不复制密钥；
+# 本项目的 .env 后加载，同名键以它为准
+EnvironmentFile=-%h/perp-track/.env
+EnvironmentFile=%h/hedge-bot/.env
+ExecStart=%h/hedge-bot/.venv/bin/hedge watch
+TimeoutStartSec=300

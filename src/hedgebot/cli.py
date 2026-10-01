@@ -2,6 +2,7 @@
 
   hedge market [SYM ...] [--usd N]     两腿行情、基差、资金费、一轮成本与回本天数
   hedge account                        实盘只读：现货（Kraken + Robinhood）vs CDE 空单是否对齐
+  hedge watch [--dry-run]              巡检：对齐报警 + 模拟盘记资金费（timer 每 15 分钟跑）
   hedge rh-keygen                      生成 Robinhood API 密钥对：私钥写进 .env，打印公钥
   hedge paper open SYM [--usd N | --contracts N]
   hedge paper close SYM [--pct P]
@@ -15,7 +16,7 @@ import argparse
 import sys
 
 from . import coinbase
-from .account import hedge_table
+from .account import classify, hedge_table
 from .config import load_config, load_env
 from .executor import ExecError, LegError
 from .market import contracts_for_usd, estimate, fetch_quotes
@@ -76,53 +77,38 @@ def cmd_market(cfg, args) -> None:
 
 
 # ----------------------------------------------------------------- account
-def _adjust(delta: float, cs: float | None) -> str:
-    """把净 delta 调到最接近 0 需要再空/平几张。只能整张，所以会剩零头。"""
-    if not cs:
-        return "CDE 无此永续"
-    n = round(delta / cs)
-    if n == 0:
-        return ""
-    rest = delta - n * cs
-    return f"{'再空' if n > 0 else '平'} {abs(n)} 张 → 余 {rest:+.6g}"
-
-
 def cmd_account(cfg, args) -> None:
     perps = coinbase.cde_perps()
-    rows, notes = hedge_table(perps)
-    out = []
-    for r in rows:
-        px = r["price"]
-        mismatch = abs(r["delta"]) / r["spot"] if r["spot"] > 0 else None
-        held = r["asset"] in cfg.hold_only
-        # 名单内且净多：多出的现货是有意的。净空超出容差则不受名单豁免
-        net_short = r["delta"] < 0 and (mismatch is None or mismatch > cfg.hedge_tolerance)
-        if held and r["perp"] == 0:
-            flag = "有意持有"
-        elif held and not net_short:
-            flag = "✓ 余量有意持有"
-        elif held:
-            flag = "⚠ 空单多于现货"
-            held = False                  # 给出调整建议
-        elif r["perp"] == 0:
-            # 只有现货、没开空单：没在名单里，列出来但不标红
-            flag = "仅现货"
-        elif mismatch is None or mismatch > cfg.hedge_tolerance:
-            flag = "⚠ 没对齐"
-        else:
-            flag = "✓"
-        parts = ", ".join(f"{k} {v:g}" for k, v in sorted(r["spot_parts"].items()))
-        out.append([r["asset"], f"{r['spot']:g}", parts or "—", f"{r['perp']:g}",
-                    f"{r['delta']:+g}", _usd(r["delta"] * px if px else None),
-                    _pct(mismatch, 1), flag,
-                    "" if held else _adjust(r["delta"], r["contract_size"])])
+    rows, notes, errors = hedge_table(perps)
+    out = [[r["asset"], f"{r['spot']:g}",
+            ", ".join(f"{k} {v:g}" for k, v in sorted(r["spot_parts"].items())) or "—",
+            f"{r['perp']:g}", f"{r['delta']:+g}", _usd(r["delta_usd"]),
+            _pct(r["mismatch"], 1), r["flag"], r["hint"]]
+           for r in classify(rows, cfg)]
     if out:
         _table(out, ["标的", "现货合计", "构成", "CDE(负=空)", "净delta",
                      "净delta美元", "偏差", "状态", "整张调整"])
     else:
         print("没有任何持仓（或凭据都没配）")
+    for e in errors:
+        print(f"  ✗ {e}")
+    if errors:
+        print("  ↑ 有来源没读到，上表的对齐结果不可信")
     for n in notes:
         print(f"  · {n}")
+
+
+# ----------------------------------------------------------------- watch
+def cmd_watch(cfg, args) -> None:
+    from .watch import run
+    for line in run(cfg, dry_run=args.dry_run):
+        print(line)
+    # 模拟盘记资金费：独立 try —— 它坏了不能拖累对齐报警（报警已经跑完了）
+    if not args.dry_run and Paper(cfg).positions():
+        try:
+            cmd_paper(cfg, argparse.Namespace(action="tick"))
+        except Exception as e:      # noqa: BLE001
+            print(f"模拟盘 tick 失败：{e}")
 
 
 # ----------------------------------------------------------------- rh-keygen
@@ -246,6 +232,8 @@ def main(argv=None) -> None:
     m.add_argument("symbols", nargs="*")
     m.add_argument("--usd", type=float)
     sub.add_parser("account", help="实盘只读对齐检查")
+    w = sub.add_parser("watch", help="巡检与报警")
+    w.add_argument("--dry-run", action="store_true", help="只打印，不发通知、不改状态")
     k = sub.add_parser("rh-keygen", help="生成 Robinhood API 密钥对")
     k.add_argument("--force", action="store_true")
     p = sub.add_parser("paper", help="模拟盘")
@@ -266,7 +254,8 @@ def main(argv=None) -> None:
 
     load_env()
     cfg = load_config()
-    {"market": cmd_market, "account": cmd_account, "rh-keygen": cmd_rh_keygen,
+    {"market": cmd_market, "account": cmd_account, "watch": cmd_watch,
+     "rh-keygen": cmd_rh_keygen,
      "paper": cmd_paper}[args.cmd](cfg, args)
 
 

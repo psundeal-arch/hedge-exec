@@ -1,0 +1,8 @@
+[Unit]
+Description=hedge-bot watch 进程异常时的独立传呼
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/perp-track/.env
+# 裸 curl，不走项目 Python —— 单元失败的原因可能就在 Python 侧
+ExecStart=%h/hedge-bot/deploy/page-failed.sh

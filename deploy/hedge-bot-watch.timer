@@ -1,0 +1,11 @@
+[Unit]
+Description=每 15 分钟巡检一次两腿对齐
+
+[Timer]
+# 错开整点结算与 perp-track（:00 margin-watch、:02 funding-tick）
+OnCalendar=*-*-* *:05/15:00 UTC
+Persistent=false
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

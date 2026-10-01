@@ -27,6 +27,9 @@ class Config:
     default_usd: float
     db_path: Path
     hold_only: frozenset[str] = frozenset()   # 有意只持现货、不对冲的标的
+    min_alert_usd: float = 200.0
+    blind_after: int = 3
+    resend_hours: tuple[float, ...] = (1, 3, 6, 12, 24)
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -43,6 +46,7 @@ def load_config(path: Path | None = None) -> Config:
         if not 0 <= v < 0.02:
             raise ValueError(f"fees.{k} = {v}：应写成小数，0.004 = 0.40%")
     risk = raw["risk"]
+    watch = raw.get("watch", {})
     return Config(
         symbols={k.upper(): v for k, v in raw["symbols"].items()},
         fees=fees,
@@ -51,6 +55,9 @@ def load_config(path: Path | None = None) -> Config:
         default_usd=float(risk["default_usd"]),
         db_path=PROJECT_ROOT / "data" / "paper.db",
         hold_only=frozenset(s.upper() for s in risk.get("hold_only", [])),
+        min_alert_usd=float(watch.get("min_alert_usd", 200)),
+        blind_after=int(watch.get("blind_after", 3)),
+        resend_hours=tuple(float(x) for x in watch.get("resend_hours", (1, 3, 6, 12, 24))),
     )
 
 
