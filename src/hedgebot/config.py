@@ -18,15 +18,6 @@ class Fees:
     cde_per_contract: float = 0.0     # 美元/张，按张收的固定费
     coinbase_taker: float = 0.0030
     coinbase_maker: float = 0.0015
-    coinbase_rebate: float = 0.0      # 现货手续费返还比例（Coinbase One 25%）
-
-    @property
-    def coinbase_maker_net(self) -> float:
-        return self.coinbase_maker * (1 - self.coinbase_rebate)
-
-    @property
-    def coinbase_taker_net(self) -> float:
-        return self.coinbase_taker * (1 - self.coinbase_rebate)
 
 
 @dataclass(frozen=True)
@@ -60,10 +51,6 @@ def load_config(path: Path | None = None) -> Config:
         raw = tomllib.load(f)
     fees = Fees(**{k: float(v) for k, v in raw["fees"].items()})
     for k, v in vars(fees).items():
-        if k == "coinbase_rebate":
-            if not 0 <= v < 1:
-                raise ValueError(f"fees.{k} = {v}：是返还比例，0.25 = 25%")
-            continue
         if k == "cde_per_contract":
             if not 0 <= v < 5:
                 raise ValueError(f"fees.{k} = {v}：是每张多少美元")

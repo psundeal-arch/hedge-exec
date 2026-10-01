@@ -25,10 +25,6 @@ kraken_taker = 0.0040
 kraken_maker = 0.0025
 coinbase_taker = 0.0030
 coinbase_maker = 0.0015
-# Coinbase One：Advanced【现货】手续费返还 25%，USDC 入账、几分钟到账、无月度上限
-# （2026-10-01 流水 subscription_rebate 逐笔核对 = 手续费 × 0.25000）。
-# CDE 合约手续费没有返利（227 笔成交无负手续费、流水无对应类型）
-coinbase_rebate = 0.25
 cde_taker = 0.0007
 cde_maker = 0.00055
 cde_per_contract = 0.12
