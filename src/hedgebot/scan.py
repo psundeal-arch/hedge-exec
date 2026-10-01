@@ -69,10 +69,10 @@ def static_scan(cfg: Config, symbols: list[str], funding_db: Path | None) -> lis
         a = avgs.get(p["product_id"], {})
         apr = a.get("24h")
         apr = apr if apr is not None else (p["funding_rate"] or 0) * 8760 * 100
-        # 一轮（开 + 平）成本，按一块的规模：现货两次挂单 + CDE 两次吃单（含每张固定费）
+        # 一轮（开 + 平）成本（现货按扣掉返利后的净费率），按一块的规模：现货两次挂单 + CDE 两次吃单（含每张固定费）
         # + CDE 吃单越过半个价差两次。现货是挂单，不付价差
         perp_half_spread = (pb.best_ask - pb.best_bid) / 2 / pb.mid
-        cost_pct = (2 * f.coinbase_maker + 2 * f.cde_taker
+        cost_pct = (2 * f.coinbase_maker_net + 2 * f.cde_taker
                     + 2 * f.cde_per_contract / per_contract + 2 * perp_half_spread) * 100
         margin = p["margin_short_overnight"] or 0
         row.update({

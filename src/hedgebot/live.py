@@ -75,7 +75,7 @@ def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool, paper:
     if spot_venue == "coinbase":
         spot = CoinbaseLeg(cb_auth, f"{symbol}-USD", is_perp=False)
         avail = lambda: coinbase_available(cb_auth)            # noqa: E731
-        maker = cfg.fees.coinbase_maker
+        maker = cfg.fees.coinbase_maker_net         # 扣掉 Coinbase One 25% 返利
     else:
         pair = cfg.symbols.get(symbol)
         if not pair:
@@ -85,7 +85,7 @@ def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool, paper:
         maker = cfg.fees.kraken_maker
     if paper:
         f = cfg.fees
-        taker = f.coinbase_taker if spot_venue == "coinbase" else f.kraken_taker
+        taker = f.coinbase_taker_net if spot_venue == "coinbase" else f.kraken_taker
         # 先把代码绑定下来 —— 下一行 spot 就被换成模拟腿了，闭包里不能再引用它
         ident = spot.product_id if spot_venue == "coinbase" else spot.pair
         trades = ((lambda: coinbase_trades(ident)) if spot_venue == "coinbase"
