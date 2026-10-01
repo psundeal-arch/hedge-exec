@@ -177,3 +177,11 @@ def test_cde_per_contract_fee():
     base = estimate(quote(), 2, Fees(0.004, 0.0025, 0.0005, 0.0002))
     with_fixed = estimate(quote(), 2, Fees(0.004, 0.0025, 0.0005, 0.0002, 0.1))
     assert with_fixed["fees"] - base["fees"] == pytest.approx(2 * 2 * 0.1)   # 开+平 各 2 张
+
+
+def test_price_unit_from_display_name():
+    from hedgebot.coinbase import price_unit
+    assert price_unit({"future_product_details": {"contract_display_name": "1000PEPE PERP"}}) == 1000
+    assert price_unit({"display_name": "1000SHIB PERP", "future_product_details": {}}) == 1000
+    assert price_unit({"future_product_details": {"contract_display_name": "BTC PERP"}}) == 1
+    assert price_unit({"future_product_details": {"contract_display_name": "ZCASH PERP"}}) == 1

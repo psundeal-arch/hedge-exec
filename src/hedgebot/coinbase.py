@@ -5,10 +5,15 @@
   perpetual_details.funding_rate 是 INTX 用的，对 CDE 是空串。
 - 合约乘数各不相同（BTC 0.01、ETH 0.1、LTC 5），取不到就报错，【不要】默认 1。
 - 订单簿的数量单位是【张】。
+- 【报价单位】PEPE、SHIB 这类合约叫「1000PEPE PERP」：价格是每 1000 枚，合约乘数
+  也以 1000 枚为单位（1 张 PEPE = 100000 × 1000 = 1 亿枚 ≈ $439）。不换算的话，
+  对冲现货只会买到千分之一。所以这里在入口统一换算成【每枚币】：价格 ÷ unit，
+  contract_size = 每张合约对应多少枚币。往上的代码只见到「每枚」的口径。
 """
 from __future__ import annotations
 
 import base64
+import re
 import secrets
 import time
 
@@ -25,6 +30,16 @@ def _f(v):
     if v is None or (isinstance(v, str) and not v.strip()):
         return None
     return float(v)
+
+
+def price_unit(product: dict) -> float:
+    """合约名开头的数字就是报价单位：「1000PEPE PERP」→ 1000，「BTC PERP」→ 1。"""
+    d = product.get("future_product_details") or {}
+    for name in (d.get("contract_display_name"), product.get("display_name")):
+        m = re.match(r"^\s*(\d+)\s*[A-Za-z]", name or "")
+        if m:
+            return float(m.group(1))
+    return 1.0
 
 
 def cde_perps() -> dict[str, dict]:
@@ -49,12 +64,16 @@ def cde_perps() -> dict[str, dict]:
         if root in out and out[root]["open_interest"] >= oi:
             continue
         interval = float(str(d["funding_interval"]).rstrip("s"))
+        unit = price_unit(p)
+        ix = _f(d.get("index_price"))
         out[root] = {
             "product_id": p["product_id"],
-            "contract_size": cs,
+            "unit": unit,                     # 报价单位：每个价格对应多少枚币
+            "contract_size": cs * unit,       # 每张合约对应多少【枚】币
+            "contract_size_raw": cs,
             "funding_rate": _f(d.get("funding_rate")),
             "interval_s": interval,
-            "index_price": _f(d.get("index_price")),
+            "index_price": ix / unit if ix is not None else None,   # 每枚
             "open_interest": oi,
             "session_open": bool((p.get("fcm_trading_session_details") or {})
                                  .get("is_session_open")),
@@ -69,12 +88,13 @@ def cde_perps() -> dict[str, dict]:
     return out
 
 
-def book(product_id: str, limit: int = 100) -> Book:
+def book(product_id: str, limit: int = 100, unit: float = 1.0) -> Book:
+    """unit ≠ 1 时价格换算成每枚（见文件头）。数量单位不变（永续仍是张）。"""
     body = request("GET", f"https://{HOST}{PRODUCT_BOOK}", f"Coinbase 订单簿 {product_id}",
                    params={"product_id": product_id, "limit": limit})
     pb = body.get("pricebook") or {}
-    return Book(bids=tuple((float(x["price"]), float(x["size"])) for x in pb.get("bids") or []),
-                asks=tuple((float(x["price"]), float(x["size"])) for x in pb.get("asks") or []))
+    return Book(bids=tuple((float(x["price"]) / unit, float(x["size"])) for x in pb.get("bids") or []),
+                asks=tuple((float(x["price"]) / unit, float(x["size"])) for x in pb.get("asks") or []))
 
 
 def _token(name: str, secret: str, method: str, path: str) -> str:

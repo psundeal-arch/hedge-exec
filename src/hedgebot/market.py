@@ -62,7 +62,7 @@ def fetch_quotes(cfg: Config, symbols: list[str]) -> tuple[list[Quote], list[str
             quotes.append(Quote(
                 symbol=s, pair=pair, product_id=p["product_id"],
                 contract_size=p["contract_size"],
-                spot=kraken.depth(pair), perp=coinbase.book(p["product_id"]),
+                spot=kraken.depth(pair), perp=coinbase.book(p["product_id"], unit=p["unit"]),
                 funding_rate=p["funding_rate"], interval_s=p["interval_s"],
                 index_price=p["index_price"],
                 session_open=p["session_open"] and not p["trading_disabled"],

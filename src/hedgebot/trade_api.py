@@ -83,12 +83,14 @@ class CoinbaseLeg:
         self.name = "cde" if is_perp else "coinbase"
         p = request("GET", f"https://{coinbase.HOST}{coinbase.PRODUCTS}/{product_id}",
                     f"Coinbase 合约规格 {product_id}")
-        self.tick = float(p.get("price_increment") or p["quote_increment"])
+        # 永续的报价单位（1000PEPE → 1000）。对上层一律给「每枚」价格，见 coinbase.py 文件头
+        self.unit = coinbase.price_unit(p) if is_perp else 1.0
+        self.tick = float(p.get("price_increment") or p["quote_increment"]) / self.unit
         self.lot = float(p["base_increment"])
         self.min_qty = float(p.get("base_min_size") or self.lot)
 
     def book(self) -> Book:
-        return coinbase.book(self.product_id)
+        return coinbase.book(self.product_id, unit=self.unit)
 
     def _submit(self, side: str, config: dict, label: str) -> str:
         body = {"client_order_id": str(uuid.uuid4()), "product_id": self.product_id,
@@ -102,13 +104,14 @@ class CoinbaseLeg:
 
     def place_post_only(self, side: str, qty: float, px: float) -> str:
         return self._submit(side, {"limit_limit_gtc": {
-            "base_size": fmt(qty, self.lot), "limit_price": fmt(px, self.tick),
+            "base_size": fmt(qty, self.lot), "limit_price": fmt(px * self.unit, self.tick * self.unit),
             "post_only": True}}, f"{self.name} 挂单 {side} {qty:g}@{px:g}")
 
     def status(self, oid: str) -> OrderState:
         o = self.auth.call("GET", f"{ORDERS}/historical/{oid}", f"{self.name} 订单 {oid}")["order"]
         filled = float(o.get("filled_size") or 0)
-        avg = float(o["average_filled_price"]) if filled and o.get("average_filled_price") else None
+        avg = (float(o["average_filled_price"]) / self.unit
+               if filled and o.get("average_filled_price") else None)
         return OrderState(filled, avg, float(o.get("total_fees") or 0),
                           o.get("status") in CB_OPEN, o.get("status", ""),
                           o.get("reject_reason") or o.get("cancel_message") or "")
@@ -124,7 +127,7 @@ class CoinbaseLeg:
         else:
             # 现货：带限价的 IOC —— 簿子突然变薄时最多吃到 limit_px，剩余撤销
             config = {"sor_limit_ioc": {"base_size": fmt(qty, self.lot),
-                                        "limit_price": fmt(limit_px, self.tick)}}
+                                        "limit_price": fmt(limit_px * self.unit, self.tick * self.unit)}}
         oid = self._submit(side, config, f"{self.name} 吃单 {side} {qty:g}")
         return _wait_final(self, oid)
 
