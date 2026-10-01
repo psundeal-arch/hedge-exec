@@ -76,6 +76,17 @@ def cmd_market(cfg, args) -> None:
 
 
 # ----------------------------------------------------------------- account
+def _adjust(delta: float, cs: float | None) -> str:
+    """把净 delta 调到最接近 0 需要再空/平几张。只能整张，所以会剩零头。"""
+    if not cs:
+        return "CDE 无此永续"
+    n = round(delta / cs)
+    if n == 0:
+        return ""
+    rest = delta - n * cs
+    return f"{'再空' if n > 0 else '平'} {abs(n)} 张 → 余 {rest:+.6g}"
+
+
 def cmd_account(cfg, args) -> None:
     perps = coinbase.cde_perps()
     rows, notes = hedge_table(perps)
@@ -83,16 +94,22 @@ def cmd_account(cfg, args) -> None:
     for r in rows:
         px = r["price"]
         mismatch = abs(r["delta"]) / r["spot"] if r["spot"] > 0 else None
-        bad = (r["perp"] != 0 and (mismatch is None or mismatch > cfg.hedge_tolerance))
+        if r["perp"] == 0:
+            # 只有现货、没开空单：可能就是想持有，不算「没对齐」，但要看得见
+            flag = "仅现货"
+        elif mismatch is None or mismatch > cfg.hedge_tolerance:
+            flag = "⚠ 没对齐"
+        else:
+            flag = "✓"
         parts = ", ".join(f"{k} {v:g}" for k, v in sorted(r["spot_parts"].items()))
         out.append([r["asset"], f"{r['spot']:g}", parts or "—", f"{r['perp']:g}",
                     f"{r['delta']:+g}", _usd(r["delta"] * px if px else None),
-                    _pct(mismatch, 1), "⚠ 没对齐" if bad else ""])
+                    _pct(mismatch, 1), flag, _adjust(r["delta"], r["contract_size"])])
     if out:
         _table(out, ["标的", "现货合计", "构成", "CDE(负=空)", "净delta",
-                     "净delta美元", "偏差", ""])
+                     "净delta美元", "偏差", "状态", "整张调整"])
     else:
-        print("没有任何持仓（或两边凭据都没配）")
+        print("没有任何持仓（或凭据都没配）")
     for n in notes:
         print(f"  · {n}")
 

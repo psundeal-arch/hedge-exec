@@ -65,5 +65,6 @@ def hedge_table(perps: dict[str, dict]) -> tuple[list[dict], list[str]]:
         perp_qty = shorts.get(asset, 0.0)       # 空单为负
         rows.append({"asset": asset, "spot": long_qty, "spot_parts": parts,
                      "perp": perp_qty, "delta": long_qty + perp_qty,
-                     "price": perps.get(asset, {}).get("index_price")})
+                     "price": perps.get(asset, {}).get("index_price"),
+                     "contract_size": perps.get(asset, {}).get("contract_size")})
     return rows, notes
