@@ -24,6 +24,7 @@ HOST = "api.coinbase.com"
 PRODUCTS = "/api/v3/brokerage/market/products"
 PRODUCT_BOOK = "/api/v3/brokerage/market/product_book"
 POSITIONS = "/api/v3/brokerage/cfm/positions"
+ACCOUNTS = "/api/v3/brokerage/accounts"
 
 
 def _f(v):
@@ -112,6 +113,30 @@ def _token(name: str, secret: str, method: str, path: str) -> str:
                        "uri": f"{method} {HOST}{path}"},
                       key, algorithm="EdDSA",
                       headers={"kid": name, "nonce": secrets.token_hex(16)})
+
+
+def spot_balances(key_name: str, key_secret: str) -> dict[str, float]:
+    """现货账户里每个币的【总量】（可用 + 挂单冻结）。View 权限即可。
+
+    冻结的也算 —— 对冲看的是价格风险，挂着卖单的币涨跌照样算你的。
+    """
+    out: dict[str, float] = {}
+    cursor = None
+    for _ in range(20):
+        params = {"limit": 250, **({"cursor": cursor} if cursor else {})}
+        tok = _token(key_name, key_secret, "GET", ACCOUNTS)
+        body = request("GET", f"https://{HOST}{ACCOUNTS}", "Coinbase 现货余额",
+                       headers={"Authorization": f"Bearer {tok}"}, params=params)
+        for a in body.get("accounts") or []:
+            v = sum(float((a.get(k) or {}).get("value") or 0)
+                    for k in ("available_balance", "hold"))
+            if v:
+                cur = (a.get("currency") or "").upper()
+                out[cur] = out.get(cur, 0.0) + v
+        if not body.get("has_next"):
+            break
+        cursor = body.get("cursor")
+    return out
 
 
 def positions(key_name: str, key_secret: str) -> list[dict]:

@@ -1,4 +1,4 @@
-"""实盘只读：现货（Kraken + Robinhood）vs CDE 空单，按标的对齐。"""
+"""实盘只读：现货（Kraken + Robinhood + Coinbase）vs CDE 空单，按标的对齐。"""
 from __future__ import annotations
 
 import os
@@ -50,6 +50,14 @@ def hedge_table(perps: dict[str, dict]) -> tuple[list[dict], list[str], list[str
 
     cn, cs = os.environ.get("COINBASE_API_KEY_NAME"), os.environ.get("COINBASE_API_PRIVATE_KEY")
     if cn and cs:
+        # Coinbase 现货：hedge live --spot coinbase 买的币在这里
+        try:
+            for asset, amt in coinbase.spot_balances(cn, cs).items():
+                # 小于 1e-6 的是历史尘埃（实测 ETH 5e-9），不让它出现在表里
+                if amt > 1e-6:
+                    spot.setdefault(asset, {})["Coinbase"] = amt
+        except SourceError as e:
+            errors.append(f"Coinbase 现货余额取数失败：{e}")
         by_product = {p["product_id"]: (root, p["contract_size"]) for root, p in perps.items()}
         try:
             for r in coinbase.positions(cn, cs):
