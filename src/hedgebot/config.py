@@ -26,7 +26,8 @@ class Live:
     max_wait_s: float = 600
     reprice_min_s: float = 4
     poll_s: float = 2
-    taker_slippage_bps: float = 30
+    clip_usd: float = 2000
+    hedge_escalation_bps: tuple[float, ...] = (30, 100, 300)
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,8 @@ def load_config(path: Path | None = None) -> Config:
         min_alert_usd=float(watch.get("min_alert_usd", 200)),
         blind_after=int(watch.get("blind_after", 3)),
         resend_hours=tuple(float(x) for x in watch.get("resend_hours", (1, 3, 6, 12, 24))),
-        live=Live(**{k: float(v) for k, v in raw.get("live", {}).items()}),
+        live=Live(**{k: tuple(float(x) for x in v) if isinstance(v, list) else float(v)
+                     for k, v in raw.get("live", {}).items()}),
     )
 
 

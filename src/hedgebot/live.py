@@ -285,11 +285,12 @@ def _run(cfg: Config, args, plan: dict, *, mode: str) -> None:
                     contract_size=plan["cs"], on_fill=on_fill,
                     params=Params(poll_s=lv.poll_s, reprice_min_s=lv.reprice_min_s,
                                   max_wait_s=args.max_wait or lv.max_wait_s,
-                                  taker_slippage_bps=lv.taker_slippage_bps, finish=args.finish))
+                                  finish=args.finish, clip_usd=lv.clip_usd,
+                                  hedge_escalation_bps=lv.hedge_escalation_bps))
     print()
     r = ladder.run()
     resid = r.residual(plan["cs"])
-    summary = {"spot_qty": r.spot_qty, "spot_avg": r.spot_avg, "spot_fees": r.spot_fees,
+    summary = {"max_unhedged": r.max_unhedged, "error": r.error, "spot_qty": r.spot_qty, "spot_avg": r.spot_avg, "spot_fees": r.spot_fees,
                "contracts": r.contracts, "perp_avg": r.perp_cost / (r.contracts * plan["cs"])
                if r.contracts else None, "perp_fees": r.perp_fees, "residual": resid,
                "spot_orders": r.spot_orders}
@@ -304,6 +305,11 @@ def _run(cfg: Config, args, plan: dict, *, mode: str) -> None:
         print(f"  成交基差 {(summary['perp_avg'] / r.spot_avg - 1) * 100:+.3f}%" if r.spot_avg else "")
     if abs(resid) > spot.lot:
         print(f"  ⚠ 未对冲零头 {resid:+g} {plan['symbol']}（≈ ${abs(resid) * plan['spot_mid']:,.0f}）")
-    if r.status == "aborted":
-        print("  ✗ 空单没跟上，现货已成交部分是裸腿 —— 去 CDE 手动补，或在现货平台卖掉")
+    print(f"  运行中最大未对冲 {r.max_unhedged:g} {plan['symbol']}"
+          f"（≈ ${r.max_unhedged * plan['spot_mid']:,.0f}）")
+    if r.status == "unwound":
+        print("  空单跟不上，已把没对冲的现货退掉（回到零敞口），手续费和价差是这次的成本")
+    if r.status in ("aborted", "error"):
+        print(f"  ✗ {r.error or '空单没跟上且现货回滚失败'} —— 先 hedge account 看两边，"
+              f"再手动补 CDE 或卖掉现货")
     print("  看模拟仓位：hedge paper status" if mode == "paper" else "  核对两边：hedge account")

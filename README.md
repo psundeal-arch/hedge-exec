@@ -77,10 +77,24 @@ hedge live open LTC --spot coinbase --contracts 2 --go   # 真实执行，要手
 hedge live close LTC --spot kraken --usd 3000 --go
 ```
 
-现货挂 post-only 限价单，每成交满一张合约的量就吃单跟进一张 CDE。任意时刻没对冲的敞口不到
-一张。挂单超过 `max_wait_s` 没成交完：`--finish complete`（默认）吃单补齐，`--finish trim`
-把凑不满一张的零头退掉。空单连续 3 次跟不上就撤单停手，并报告裸腿。Ctrl-C 也会先撤单、
-再对冲已成交的整张。每笔成交实时写入 `data/live.db`。
+现货挂 post-only 限价单，**分块挂**：每块最多 `clip_usd`（$2000，至少一张合约）。每成交满
+一张合约的量就吃单跟进一张 CDE。挂单超过 `max_wait_s` 还没成交完：`--finish complete`（默认）
+吃单补齐，`--finish trim` 把凑不满一张的零头退掉。每笔成交实时写入 `data/live.db`。
+
+### 剧烈行情下的处理（tests/test_stress.py 逐条覆盖）
+
+| 情况 | 处理 | 结果状态 |
+|---|---|---|
+| 一块挂单被一口吃掉（暴跌时最常见，逆向选择） | 最大裸敞口就是这一块；靠 `clip_usd` 控制大小 | done |
+| CDE 簿子被砸薄，吃单滑点超限 | **不放弃**，当场放宽限价 30 → 100 → 300bp → 市价 | done |
+| CDE 只成交一部分 | 同一轮里放宽一档继续吃 | done |
+| CDE 熔断/停牌/保证金不足（硬错误）连续 3 次 | 撤现货挂单，把没对冲的现货反向退掉，回到零敞口 | unwound |
+| 上面这步现货也退不掉 | 如实报告裸腿数量，需要人工处理 | aborted |
+| 接口超时/5xx/限频等任何意外 | 撤现货挂单 → 对冲已成交的整张 → 报告剩余 | error |
+| Ctrl-C | 同上 | interrupted |
+| post-only 被拒（下单瞬间价格变了） | 按新价重挂 | done |
+
+结果里会打印「运行中最大未对冲」，就是这一轮实际承受过的单腿风险。
 
 交易 key 放 `.env.trade`，只留本机（deploy 只传 `.env`）。
 

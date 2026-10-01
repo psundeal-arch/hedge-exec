@@ -134,13 +134,14 @@ def test_timeout_trim_sells_back_fraction():
     assert r.residual(5) == pytest.approx(0)
 
 
-def test_hedge_failure_aborts_and_cancels_spot():
+def test_hedge_hard_failure_unwinds_spot():
     spot, perp = FakeSpot(step=6), FakePerp(fail=True)
     r, _ = run(spot, perp)
-    assert r.status == "aborted"
+    assert r.status == "unwound"
     assert r.contracts == 0
     assert all(not o["open"] for o in spot.orders.values())   # 挂单撤掉了
-    assert r.spot_qty > 0                                     # 已成交的现货成了裸腿，如实报告
+    assert r.spot_qty == pytest.approx(0)                     # 已成交的现货退掉了
+    assert spot.takes and spot.takes[-1][0] == "sell"
 
 
 def test_close_flips_sides():
