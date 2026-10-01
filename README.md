@@ -17,6 +17,8 @@ Robinhood 只做持仓读取；`paper` 模拟盘的现货腿目前只按 Kraken 
 hedge market                    # 全部标的：两边中价、基差、资金费年化、开平一轮成本、回本天数
 hedge market LTC AVAX --usd 10000
 hedge account                   # 实盘只读：现货（Kraken 含质押 + Robinhood）vs CDE 空单，标出没对齐的
+hedge watch [--dry-run]         # 巡检：对齐报警 + 模拟盘记资金费（服务器上每 15 分钟跑）
+hedge watch --test-notify       # 发一条测试通知，验证 Discord / Pushover 通道
 hedge rh-keygen                 # 生成 Robinhood API 密钥对（私钥写入 .env，只打印公钥）
 hedge paper open LTC --usd 2000 # 模拟：卖永续 + 买等量现货
 hedge paper close LTC --pct 50  # 模拟反向平仓：买平空单 + 卖现货
@@ -54,6 +56,18 @@ hedge paper history             # 成交明细与已平仓记录
 
 CDE 手续费 = 比例费 + 每张固定费（2026-10-01 用 91 笔真实 maker 成交拟合：0.0677% + $0.0917/张）。
 固定费让小合约吃亏（AVAX 实际 0.165%，BTC 0.079%）。taker 还没有实测样本。
+
+## 巡检与报警（watch）
+
+部署在 rhserver（与 perp-track 同机）：`./deploy/deploy.sh`，systemd timer 每 15 分钟一次
+（:05/:20/:35/:50 UTC，错开整点结算和 perp-track）。
+
+- **没对齐**：标 ⚠ 且净敞口 ≥ `min_alert_usd`（$200）→ Pushover priority 1 + Discord。
+  持续存在按 1h/3h/6h/12h/24h 退避重发，消失时发一条恢复通知。
+- **取数有任何一边失败 → 本轮不评估对齐**。否则 Robinhood 一抖，现货读成 0，就是一条假的
+  「裸空」报警。已有的报警记录原样保留，连续 3 轮（45 分钟）失败才报「监控看不见」。
+- **进程本身崩溃** → `hedge-bot-failed.service` 用裸 curl 发 Pushover，6 小时内最多一次。
+- 通知凭据读 `~/perp-track/.env`，不复制密钥。报警状态在 `data/watch.db`。
 
 ## 下一步（实盘）
 

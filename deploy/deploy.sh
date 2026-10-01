@@ -24,7 +24,7 @@ rsync -az --delete \
 echo "==> 传 .env（600）"
 scp -q "$LOCAL_DIR/.env" "$TARGET:$REMOTE_DIR/.env"
 ssh "$TARGET" "chmod 600 $REMOTE_DIR/.env && mkdir -p $REMOTE_DIR/data"
-echo "    键：$(sed -n 's/=.*//p' "$LOCAL_DIR/.env" | tr '\n' ' ')"
+echo "    键：$(grep -oE '^[A-Z_]+=' "$LOCAL_DIR/.env" | tr -d '=' | tr '\n' ' ')"
 
 echo "==> venv + 测试"
 ssh "$TARGET" "cd $REMOTE_DIR && python3 -m venv .venv && .venv/bin/pip install -q -e '.[dev]' \

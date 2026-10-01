@@ -101,6 +101,11 @@ def cmd_account(cfg, args) -> None:
 # ----------------------------------------------------------------- watch
 def cmd_watch(cfg, args) -> None:
     from .watch import run
+    if args.test_notify:
+        from .notify import send
+        ok, fails = send("[hedge-bot] 测试通知", "通道连通性测试，可忽略。", 0)
+        print("至少一个通道送达" if ok else "全部失败", *fails, sep="\n  ")
+        return
     for line in run(cfg, dry_run=args.dry_run):
         print(line)
     # 模拟盘记资金费：独立 try —— 它坏了不能拖累对齐报警（报警已经跑完了）
@@ -234,6 +239,7 @@ def main(argv=None) -> None:
     sub.add_parser("account", help="实盘只读对齐检查")
     w = sub.add_parser("watch", help="巡检与报警")
     w.add_argument("--dry-run", action="store_true", help="只打印，不发通知、不改状态")
+    w.add_argument("--test-notify", action="store_true", help="只发一条测试通知")
     k = sub.add_parser("rh-keygen", help="生成 Robinhood API 密钥对")
     k.add_argument("--force", action="store_true")
     p = sub.add_parser("paper", help="模拟盘")
