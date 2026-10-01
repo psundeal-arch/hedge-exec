@@ -33,7 +33,7 @@ from typing import Callable
 
 from .book import walk
 from .http import SourceError
-from .trade_api import OrderState, round_down, round_up
+from .trade_api import OrderState, PostOnlyRejected, round_down, round_up
 
 EPS = 1e-9
 MARKET_BPS = 2000.0           # 「市价档」：永续发真正的市价单；现货仍带 20% 保护价
@@ -50,6 +50,7 @@ class Params:
     max_wait_s: float = 600.0
     finish: str = "complete"          # complete | trim
     max_hedge_failures: int = 3
+    max_post_rejects: int = 30        # 连续被「只挂单」拒这么多次才停手（行情在单边狂奔）
     clip_usd: float = 2000.0          # 现货每块最多挂多少美元（至少一张合约的量）
     hedge_escalation_bps: tuple[float, ...] = (30.0, 100.0, 300.0)
 
@@ -95,6 +96,7 @@ class Ladder:
         self.r = Result()
         self.cur: dict | None = None          # 当前挂着的现货单
         self.hard_failures = 0
+        self.post_rejects = 0
 
     # ------------------------------------------------------------ 工具
     def say(self, msg: str) -> None:
@@ -120,7 +122,8 @@ class Ladder:
         n = max(1, math.floor(self.p.clip_usd / (self.cs * px)))
         return n * self.cs
 
-    def _place(self) -> None:
+    def _place(self) -> str:
+        """挂一块。返回 placed / rejected（只挂单被拒，稍后重挂）/ small（剩余量太小）。"""
         book = self.spot.book()
         bid, ask = book.best_bid, book.best_ask
         if bid is None or ask is None:
@@ -129,18 +132,29 @@ class Ladder:
         rem = round_down(min(rem, self._clip_qty((bid + ask) / 2)), self.spot.lot)
         if rem < self.spot.min_qty:
             self.cur = None
-            return
+            return "small"
         t = self.spot.tick
         if self.spot_side == "buy":
             px = round_down(bid + t if ask - bid > 1.5 * t else bid, t)
         else:
             px = round_up(ask - t if ask - bid > 1.5 * t else ask, t)
-        oid = self.spot.place_post_only(self.spot_side, rem, px)
+        try:
+            oid = self.spot.place_post_only(self.spot_side, rem, px)
+        except PostOnlyRejected:
+            self.post_rejects += 1
+            self.say(f"  挂{'买' if self.spot_side == 'buy' else '卖'} {rem:g} @ {px:g} 会变成吃单被拒"
+                     f"（连续第 {self.post_rejects} 次），按新价重挂")
+            if self.post_rejects >= self.p.max_post_rejects:
+                raise SourceError(f"连续 {self.post_rejects} 次只挂单被拒，行情单边太快，停手")
+            self.cur = None
+            return "rejected"
+        self.post_rejects = 0
         self.r.spot_orders += 1
         self.cur = {"oid": oid, "px": px, "filled": 0.0, "cost": 0.0, "fee": 0.0,
                     "at": self.clock()}
         self.say(f"现货挂{'买' if self.spot_side == 'buy' else '卖'} {rem:g} @ {px:g}"
                  f"（买一 {bid:g} / 卖一 {ask:g}）")
+        return "placed"
 
     def _sync(self) -> OrderState:
         """读当前挂单的累计成交，把【增量】记进结果。"""
@@ -308,9 +322,12 @@ class Ladder:
                 if timed_out:
                     self.say("挂单超时，进入收尾")
                     break
-                self._place()
-                if self.cur is None:          # 剩余量低于最小下单量
+                res = self._place()
+                if res == "small":            # 剩余量低于最小下单量
                     break
+                if res == "rejected":         # 等一下让簿子稳定，再按新价挂
+                    self.sleep(min(self.p.poll_s, 0.5))
+                    continue
             else:
                 st = self._sync()
                 if not st.open:

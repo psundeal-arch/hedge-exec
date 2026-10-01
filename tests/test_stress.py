@@ -208,3 +208,33 @@ def test_market_step_sends_no_limit():
     r = go(spot, perp, contracts=1)
     assert r.contracts == 1
     assert perp.takes[-1][2] is None
+
+
+class SyncRejectSpot(Spot):
+    """Coinbase 式的同步拒单：下单请求直接报错，不生成订单。"""
+
+    def __init__(self, n_reject, **kw):
+        super().__init__(**kw)
+        self.n_reject = n_reject
+
+    def place_post_only(self, side, qty, px):
+        from hedgebot.trade_api import PostOnlyRejected
+        if self.n_reject > 0:
+            self.n_reject -= 1
+            raise PostOnlyRejected("会变成吃单，被拒")
+        return super().place_post_only(side, qty, px)
+
+
+def test_sync_post_only_reject_retries():
+    """2026-10-01 实盘踩到：Coinbase 同步拒只挂单，原来被当成意外错误整笔停下。"""
+    spot, perp = SyncRejectSpot(2), Perp()
+    r = go(spot, perp)
+    assert r.status == "done" and r.contracts == 3
+    assert sum("被拒" in m for m in r.log) == 2
+
+
+def test_endless_post_only_rejects_stop_safely():
+    spot, perp = SyncRejectSpot(10**6), Perp()
+    r = go(spot, perp, max_post_rejects=5)
+    assert r.status == "error" and "单边" in r.error
+    assert r.spot_qty == 0 and r.contracts == 0

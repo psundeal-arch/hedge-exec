@@ -28,6 +28,15 @@ from .book import Book
 from .http import SourceError, request
 
 
+class PostOnlyRejected(SourceError):
+    """只挂单被拒：下单那一瞬间价格变了，按这个价会变成吃单。重挂即可，不是故障。
+
+    Coinbase 是在下单请求里【同步】拒（success=false，INVALID_LIMIT_PRICE_POST_ONLY），
+    不会生成订单；Kraken 则是先建单再撤（status=canceled），走 status 那条路。
+    2026-10-01 首次实盘加仓时踩到：被当成意外错误，整笔停下。
+    """
+
+
 @dataclass(frozen=True)
 class OrderState:
     filled: float          # 累计成交（现货是币，永续是张）
@@ -108,6 +117,9 @@ class CoinbaseLeg:
         r = self.auth.call("POST", ORDERS, label, body)
         if not r.get("success"):
             err = r.get("error_response") or r
+            if "POST_ONLY" in str(err.get("preview_failure_reason") or "") + str(err.get("error") or "") \
+                    + str(err.get("new_order_failure_reason") or ""):
+                raise PostOnlyRejected(f"{label}：会变成吃单，被拒")
             raise SourceError(f"{label} 被拒：{err.get('error') or ''} "
                               f"{err.get('message') or err.get('preview_failure_reason') or err}")
         return (r.get("success_response") or {}).get("order_id") or r["order_id"]
