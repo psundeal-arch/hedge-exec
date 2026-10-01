@@ -49,6 +49,9 @@ class PaperSpotLeg:
         self.real = real
         self.name = real.name
         self.tick, self.lot, self.min_qty = real.tick, real.lot, real.min_qty
+        # 节奏下限跟真实腿一致，模拟出来的耗时/挂单次数才有参考价值
+        self.min_poll_s = getattr(real, "min_poll_s", 0.0)
+        self.min_reprice_s = getattr(real, "min_reprice_s", 0.0)
         self.maker_fee, self.taker_fee = maker_fee, taker_fee
         self.trades_fn = trades_fn
         self.now = now

@@ -84,6 +84,8 @@ CB_OPEN = ("OPEN", "PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED")
 class CoinbaseLeg:
     """Coinbase 现货（BTC-USD）或 CDE 永续（BIP-20DEC30-CDE）。两者走同一套下单接口；
     永续的数量单位是【张】。"""
+    min_poll_s = 0.0          # Coinbase 私有接口每秒 30 次，2 秒一查绰绰有余
+    min_reprice_s = 0.0
 
     def __init__(self, auth: _CoinbaseAuth, product_id: str, *, is_perp: bool):
         self.auth = auth
@@ -194,12 +196,23 @@ class _KrakenAuth:
         self._last_nonce = 0
 
     def call(self, path: str, data: dict, label: str) -> dict:
-        # nonce 必须严格递增；同一毫秒内连发两单会撞，所以手动保证 +1
-        nonce = max(int(time.time() * 1000), self._last_nonce + 1)
-        self._last_nonce = nonce
-        data = {"nonce": nonce, **data}
-        headers = {"API-Key": self.key, "API-Sign": kraken._sign(path, data, self.secret)}
-        body = request("POST", kraken.API + path, label, attempts=1, data=data, headers=headers)
+        """Kraken 私有接口按「计数器」限频（基础档上限 15、每 3 秒回落 1）。
+        被限频的请求【不会执行】—— 包括下单 —— 所以等一下重签名重试是安全的。
+        每次重试都用新 nonce：同一个 nonce 只能用一次。
+        """
+        for i in range(4):
+            # nonce 必须严格递增；同一毫秒内连发两单会撞，所以手动保证 +1
+            nonce = max(int(time.time() * 1000), self._last_nonce + 1)
+            self._last_nonce = nonce
+            d = {"nonce": nonce, **data}
+            headers = {"API-Key": self.key, "API-Sign": kraken._sign(path, d, self.secret)}
+            body = request("POST", kraken.API + path, label, attempts=1, data=d, headers=headers)
+            errs = " ".join(body.get("error") or [])
+            if "Rate limit" in errs or "Too many requests" in errs:
+                if i < 3:
+                    time.sleep(3 * (i + 1))
+                    continue
+            return kraken._result(body, label)
         return kraken._result(body, label)
 
 
@@ -207,6 +220,13 @@ KR_OPEN = ("pending", "open")
 
 
 class KrakenLeg:
+    # 节奏下限（Ladder 取它与配置的较大值）：
+    # - 查单：QueryOrders 每次 +1 计数，基础档每 3 秒回落 1 —— 2 秒一查会越积越多直到被拒
+    # - 撤单重挂：Kraken 对「挂上不久就撤」加罚分，5 秒内撤 +8、15 秒内 +5、45 秒外 +2
+    #   （交易计数器基础档上限 60）。4 秒就撤、追几次价就会被暂停下单
+    min_poll_s = 3.0
+    min_reprice_s = 15.0
+
     def __init__(self, auth: _KrakenAuth, pair: str):
         self.auth = auth
         self.pair = pair
@@ -227,9 +247,16 @@ class KrakenLeg:
 
     def place_post_only(self, side: str, qty: float, px: float) -> str:
         px = round_up(px, self.tick) if side == "sell" else round_down(px, self.tick)
-        return self._add({"type": side, "ordertype": "limit", "volume": fmt(qty, self.lot),
-                          "price": fmt(px, self.tick), "oflags": "post"},
-                         f"kraken 挂单 {side} {qty:g}@{px:g}")
+        try:
+            return self._add({"type": side, "ordertype": "limit", "volume": fmt(qty, self.lot),
+                              "price": fmt(px, self.tick), "oflags": "post"},
+                             f"kraken 挂单 {side} {qty:g}@{px:g}")
+        except SourceError as e:
+            # Kraken 多数情况是先建单再撤（status=canceled，reason 含 Post only），
+            # 走 status 那条路；万一在下单时直接报错，也按「被拒重挂」处理
+            if "post" in str(e).lower() and "only" in str(e).lower():
+                raise PostOnlyRejected(str(e)) from e
+            raise
 
     def status(self, oid: str) -> OrderState:
         o = self.auth.call("/0/private/QueryOrders", {"txid": oid}, f"kraken 订单 {oid}")[oid]

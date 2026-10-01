@@ -238,3 +238,28 @@ def test_endless_post_only_rejects_stop_safely():
     r = go(spot, perp, max_post_rejects=5)
     assert r.status == "error" and "单边" in r.error
     assert r.spot_qty == 0 and r.contracts == 0
+
+
+def test_venue_pacing_floor_overrides_config():
+    """Kraken 腿自带 3 秒查单 / 15 秒重挂的下限，配置里写得再小也不会更快。"""
+    class SlowVenue(Spot):
+        min_poll_s, min_reprice_s = 3.0, 15.0
+    ld = Ladder(SlowVenue(), Perp(), action="open", contracts=1, contract_size=CS,
+                params=Params(poll_s=1, reprice_min_s=2), say=lambda m: None)
+    assert ld.p.poll_s == 3.0 and ld.p.reprice_min_s == 15.0
+
+
+def test_kraken_rate_limit_retries_with_fresh_nonce(monkeypatch):
+    import hedgebot.trade_api as ta
+    calls = []
+
+    def fake_request(method, url, label, **kw):
+        calls.append(kw["data"]["nonce"])
+        if len(calls) == 1:
+            return {"error": ["EAPI:Rate limit exceeded"]}
+        return {"error": [], "result": {"ok": 1}}
+    monkeypatch.setattr(ta, "request", fake_request)
+    monkeypatch.setattr(ta.time, "sleep", lambda s: None)
+    auth = ta._KrakenAuth("k", "c2VjcmV0")
+    assert auth.call("/0/private/QueryOrders", {"txid": "x"}, "t") == {"ok": 1}
+    assert len(calls) == 2 and calls[1] > calls[0]

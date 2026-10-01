@@ -90,6 +90,11 @@ class Ladder:
         self.target_contracts = contracts
         self.cs = contract_size
         self.target_qty = round_down(contracts * contract_size, spot.lot)
+        # 场所自带的节奏下限（Kraken 限频与撤单罚分）优先于配置
+        from dataclasses import replace
+        params = replace(params,
+                         poll_s=max(params.poll_s, getattr(spot, "min_poll_s", 0.0)),
+                         reprice_min_s=max(params.reprice_min_s, getattr(spot, "min_reprice_s", 0.0)))
         self.p = params
         self.on_fill = on_fill or (lambda **kw: None)
         self.clock, self.sleep, self._say = clock, sleep, say
