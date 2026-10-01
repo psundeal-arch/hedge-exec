@@ -92,6 +92,16 @@ class CoinbaseLeg:
     def book(self) -> Book:
         return coinbase.book(self.product_id, unit=self.unit)
 
+    def _price(self, px: float, *, up: bool) -> str:
+        """每枚价格 → 交易所原始单位、取整到最小价格单位的字符串。
+
+        只按小数位数格式化是不够的：ZEC 永续最小单位 0.05，1359.27 会被拒
+        （INVALID_PRICE_PRECISION）。up=True 向上取整。
+        """
+        step = self.tick * self.unit
+        raw = px * self.unit
+        return fmt(round_up(raw, step) if up else round_down(raw, step), step)
+
     def _submit(self, side: str, config: dict, label: str) -> str:
         body = {"client_order_id": str(uuid.uuid4()), "product_id": self.product_id,
                 "side": side.upper(), "order_configuration": config}
@@ -104,7 +114,8 @@ class CoinbaseLeg:
 
     def place_post_only(self, side: str, qty: float, px: float) -> str:
         return self._submit(side, {"limit_limit_gtc": {
-            "base_size": fmt(qty, self.lot), "limit_price": fmt(px * self.unit, self.tick * self.unit),
+            # 挂单价朝「不会吃单」的方向取整：买单向下、卖单向上
+            "base_size": fmt(qty, self.lot), "limit_price": self._price(px, up=side == "sell"),
             "post_only": True}}, f"{self.name} 挂单 {side} {qty:g}@{px:g}")
 
     def status(self, oid: str) -> OrderState:
@@ -120,14 +131,20 @@ class CoinbaseLeg:
         self.auth.call("POST", f"{ORDERS}/batch_cancel", f"{self.name} 撤单 {oid}",
                        {"order_ids": [oid]})
 
-    def take(self, side: str, qty: float, limit_px: float) -> OrderState:
-        if self.is_perp:
-            # CDE 永续：市价 IOC，按张。滑点由上层下单前看簿子把关
+    def take(self, side: str, qty: float, limit_px: float | None) -> OrderState:
+        """带限价的 IOC：最多吃到 limit_px，剩余撤销 —— 保护价交给撮合引擎执行，
+        而不只是下单前看一眼簿子（看完到下单之间簿子可能已经变了）。
+        2026-10-01 用 preview 确认 CDE 永续接受 sor_limit_ioc。
+
+        limit_px=None → 真正的市价单（永续升级到最后一档时用）。不用一个很远的
+        限价代替：偏离太大的限价可能超出交易所价格带被直接拒掉。
+        """
+        if limit_px is None:
             config = {"market_market_ioc": {"base_size": fmt(qty, self.lot)}}
         else:
-            # 现货：带限价的 IOC —— 簿子突然变薄时最多吃到 limit_px，剩余撤销
+            # 保护价朝「更容易成交」的方向取整：买单向上、卖单向下
             config = {"sor_limit_ioc": {"base_size": fmt(qty, self.lot),
-                                        "limit_price": fmt(limit_px * self.unit, self.tick * self.unit)}}
+                                        "limit_price": self._price(limit_px, up=side == "buy")}}
         oid = self._submit(side, config, f"{self.name} 吃单 {side} {qty:g}")
         return _wait_final(self, oid)
 
@@ -197,6 +214,7 @@ class KrakenLeg:
         return r["txid"][0]
 
     def place_post_only(self, side: str, qty: float, px: float) -> str:
+        px = round_up(px, self.tick) if side == "sell" else round_down(px, self.tick)
         return self._add({"type": side, "ordertype": "limit", "volume": fmt(qty, self.lot),
                           "price": fmt(px, self.tick), "oflags": "post"},
                          f"kraken 挂单 {side} {qty:g}@{px:g}")
@@ -216,10 +234,14 @@ class KrakenLeg:
             if "Unknown order" not in str(e):
                 raise
 
-    def take(self, side: str, qty: float, limit_px: float) -> OrderState:
-        oid = self._add({"type": side, "ordertype": "limit", "volume": fmt(qty, self.lot),
-                         "price": fmt(limit_px, self.tick), "timeinforce": "IOC"},
-                        f"kraken 吃单 {side} {qty:g}")
+    def take(self, side: str, qty: float, limit_px: float | None) -> OrderState:
+        if limit_px is None:
+            data = {"type": side, "ordertype": "market", "volume": fmt(qty, self.lot)}
+        else:
+            px = round_up(limit_px, self.tick) if side == "buy" else round_down(limit_px, self.tick)
+            data = {"type": side, "ordertype": "limit", "volume": fmt(qty, self.lot),
+                    "price": fmt(px, self.tick), "timeinforce": "IOC"}
+        oid = self._add(data, f"kraken 吃单 {side} {qty:g}")
         return _wait_final(self, oid)
 
     def preview(self, side: str, qty: float) -> dict:

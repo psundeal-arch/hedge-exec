@@ -36,7 +36,7 @@ from .http import SourceError
 from .trade_api import OrderState, round_down, round_up
 
 EPS = 1e-9
-MARKET_BPS = 2000.0           # 「市价档」的保护价：偏离 20%，只防胖手指，不防行情
+MARKET_BPS = 2000.0           # 「市价档」：永续发真正的市价单；现货仍带 20% 保护价
 
 
 class HedgeStuck(RuntimeError):
@@ -205,7 +205,8 @@ class Ladder:
                     self.say(f"  CDE 吃 {want} 张超出 {bps:g}bp（深度 {depth:g}），放宽一档")
                     continue
             try:
-                st = self.perp.take(self.perp_side, want, self._limit(ref, self.perp_side, bps))
+                limit = None if bps >= MARKET_BPS else self._limit(ref, self.perp_side, bps)
+                st = self.perp.take(self.perp_side, want, limit)
             except SourceError as e:
                 return self._hedge_failed(str(e))
             got = int(round(st.filled))

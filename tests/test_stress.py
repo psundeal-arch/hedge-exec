@@ -185,3 +185,26 @@ def test_ctrl_c_hedges_what_filled():
     assert r.status == "interrupted"
     assert 0 < r.contracts < 10
     assert r.residual(CS) == pytest.approx(0)
+
+
+def test_session_risk_window():
+    import datetime as dt
+    from hedgebot.live import session_risk
+    now = dt.datetime(2026, 10, 1, 20, 50, tzinfo=dt.timezone.utc)
+    p = {"close_time": "2026-10-01T21:00:00Z",
+         "maintenance": {"start_time": "2026-10-24T10:00:00Z", "end_time": "2026-10-24T19:00:00Z"}}
+    assert "切换" in session_risk(p, now, 900)                       # 10 分钟后切换，窗口 15 分钟
+    assert session_risk(p, now - dt.timedelta(hours=1), 900) is None
+    during = dt.datetime(2026, 10, 24, 12, 0, tzinfo=dt.timezone.utc)
+    assert "维护" in session_risk({"maintenance": p["maintenance"]}, during, 900)
+    before = dt.datetime(2026, 10, 24, 9, 50, tzinfo=dt.timezone.utc)
+    assert "维护" in session_risk({"maintenance": p["maintenance"]}, before, 900)
+
+
+def test_market_step_sends_no_limit():
+    """升级到最后一档时永续发真正的市价单（limit=None），而不是一个很远的限价。"""
+    deep_only_far = lambda: Book(bids=((100.2, 0.5), (60.0, 100)), asks=((100.3, 100),))  # noqa: E731
+    spot, perp = Spot(), Perp(deep_only_far)
+    r = go(spot, perp, contracts=1)
+    assert r.contracts == 1
+    assert perp.takes[-1][2] is None

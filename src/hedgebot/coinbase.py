@@ -78,6 +78,8 @@ def cde_perps() -> dict[str, dict]:
             "open_interest": oi,
             "session_open": bool((p.get("fcm_trading_session_details") or {})
                                  .get("is_session_open")),
+            "close_time": (p.get("fcm_trading_session_details") or {}).get("close_time"),
+            "maintenance": (p.get("fcm_trading_session_details") or {}).get("maintenance"),
             "trading_disabled": bool(p.get("trading_disabled")),
             "margin_short_overnight": _f((d.get("overnight_margin_rate") or {})
                                          .get("short_margin_rate")),

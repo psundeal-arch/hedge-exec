@@ -97,6 +97,26 @@ def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool, paper:
     return p, spot, perp, cb_auth, avail, maker, notes
 
 
+def session_risk(perp: dict, now: dt.datetime, window_s: float) -> str | None:
+    """CDE 在 window_s 秒内会闭市或进维护窗口 → 返回原因。
+
+    一轮挂单最长要 max_wait_s；跑到一半闭市，空单就跟不上了，现货成了裸腿。
+    close_time 是交易日的切换点（每天 21:00 UTC），不一定真的停盘 ——
+    这里按会停处理，宁可多等一刻钟。
+    """
+    def parse(t):
+        return dt.datetime.fromisoformat(t.replace("Z", "+00:00")) if t else None
+
+    close = parse(perp.get("close_time"))
+    if close and 0 <= (close - now).total_seconds() < window_s:
+        return f"距 CDE 交易日切换（{close:%H:%M} UTC）只剩 {(close - now).total_seconds() / 60:.0f} 分钟"
+    m = perp.get("maintenance") or {}
+    start, end = parse(m.get("start_time")), parse(m.get("end_time"))
+    if start and end and (start - now).total_seconds() < window_s and now < end:
+        return f"CDE 维护窗口 {start:%m-%d %H:%M}–{end:%H:%M} UTC 临近或进行中"
+    return None
+
+
 def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
     """所有能在下单前查的都查一遍。返回计划；有致命问题时 plan['blockers'] 非空。"""
     sym = args.symbol.upper()
@@ -114,6 +134,16 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
 
     if contracts < 1:
         blockers.append("不足一张合约")
+    # 缓冲 = 本轮最长挂单时间 + 5 分钟收尾
+    window = (args.max_wait or cfg.live.max_wait_s) + 300
+    why = session_risk(p, dt.datetime.now(dt.timezone.utc), window)
+    if why:
+        # 开仓直接拦；平仓只提醒 —— 出事要跑的时候不能被这条挡住
+        (blockers if args.action == "open" else warns).append(
+            f"{why}，一轮最长要 {window / 60:.0f} 分钟" + ("" if args.action == "open"
+                                                        else "，平仓照做但可能跟不上"))
+    if args.action == "open" and (p["funding_rate"] or 0) <= 0:
+        warns.append(f"当前资金费 {p['funding_rate']}（≤0）：现在开空单是付钱不是收钱")
     if not p["session_open"] or p["trading_disabled"]:
         blockers.append("CDE 现在闭市或停牌")
     if notional > cfg.live.max_notional_usd:

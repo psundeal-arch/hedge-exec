@@ -128,7 +128,9 @@ class PaperPerpLeg:
 
 def _take(book, side: str, qty: float, limit_px: float, *, mult: float,
           fee_rate: float, per_unit: float) -> OrderState:
-    if side == "buy":
+    if limit_px is None:                                 # 市价
+        levels = list(book.asks if side == "buy" else book.bids)
+    elif side == "buy":
         levels = [(p, s) for p, s in book.asks if p <= limit_px]
     else:
         levels = [(p, s) for p, s in book.bids if p >= limit_px]
