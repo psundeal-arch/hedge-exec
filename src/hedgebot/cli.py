@@ -94,8 +94,13 @@ def cmd_account(cfg, args) -> None:
     for r in rows:
         px = r["price"]
         mismatch = abs(r["delta"]) / r["spot"] if r["spot"] > 0 else None
-        if r["perp"] == 0:
-            # 只有现货、没开空单：可能就是想持有，不算「没对齐」，但要看得见
+        held = r["asset"] in cfg.hold_only
+        if held and r["perp"] == 0:
+            flag = "有意持有"
+        elif held:
+            flag = "⚠ 在有意持有名单里却有空单"
+        elif r["perp"] == 0:
+            # 只有现货、没开空单：没在名单里，列出来但不标红
             flag = "仅现货"
         elif mismatch is None or mismatch > cfg.hedge_tolerance:
             flag = "⚠ 没对齐"
@@ -104,7 +109,8 @@ def cmd_account(cfg, args) -> None:
         parts = ", ".join(f"{k} {v:g}" for k, v in sorted(r["spot_parts"].items()))
         out.append([r["asset"], f"{r['spot']:g}", parts or "—", f"{r['perp']:g}",
                     f"{r['delta']:+g}", _usd(r["delta"] * px if px else None),
-                    _pct(mismatch, 1), flag, _adjust(r["delta"], r["contract_size"])])
+                    _pct(mismatch, 1), flag,
+                    "" if held else _adjust(r["delta"], r["contract_size"])])
     if out:
         _table(out, ["标的", "现货合计", "构成", "CDE(负=空)", "净delta",
                      "净delta美元", "偏差", "状态", "整张调整"])

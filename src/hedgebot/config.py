@@ -25,6 +25,7 @@ class Config:
     hedge_tolerance: float
     default_usd: float
     db_path: Path
+    hold_only: frozenset[str] = frozenset()   # 有意只持现货、不对冲的标的
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -44,6 +45,7 @@ def load_config(path: Path | None = None) -> Config:
         hedge_tolerance=float(risk["hedge_tolerance"]),
         default_usd=float(risk["default_usd"]),
         db_path=PROJECT_ROOT / "data" / "paper.db",
+        hold_only=frozenset(s.upper() for s in risk.get("hold_only", [])),
     )
 
 
