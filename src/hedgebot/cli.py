@@ -2,6 +2,8 @@
 
   hedge market [SYM ...] [--usd N]     两腿行情、基差、资金费、一轮成本与回本天数
   hedge account                        实盘只读：现货（Kraken + Robinhood）vs CDE 空单是否对齐
+  hedge live open|close SYM --spot coinbase|kraken [--usd N | --contracts N] [--go]
+                                       真实开平仓：现货挂单 + 空单按成交跟进。不加 --go 只预检
   hedge watch [--dry-run]              巡检：对齐报警 + 模拟盘记资金费（timer 每 15 分钟跑）
   hedge rh-keygen                      生成 Robinhood API 密钥对：私钥写进 .env，打印公钥
   hedge paper open SYM [--usd N | --contracts N]
@@ -237,6 +239,18 @@ def main(argv=None) -> None:
     m.add_argument("symbols", nargs="*")
     m.add_argument("--usd", type=float)
     sub.add_parser("account", help="实盘只读对齐检查")
+    lv = sub.add_parser("live", help="真实开/平仓（默认只预检）")
+    lv.add_argument("action", choices=["open", "close"])
+    lv.add_argument("symbol")
+    # 不给默认值：Coinbase 便宜但买现货的现金会从 CDE 保证金里扣掉，Kraken 不扣 —— 每次自己选
+    lv.add_argument("--spot", choices=["coinbase", "kraken"], required=True)
+    g = lv.add_mutually_exclusive_group(required=True)
+    g.add_argument("--usd", type=float)
+    g.add_argument("--contracts", type=int)
+    lv.add_argument("--finish", choices=["complete", "trim"], default="complete",
+                    help="挂单超时后：complete 吃单补齐（默认）/ trim 退掉凑不满一张的零头")
+    lv.add_argument("--max-wait", type=float, help="挂单最多等多少秒（默认见 config）")
+    lv.add_argument("--go", action="store_true", help="真实下单（会要求手输确认）")
     w = sub.add_parser("watch", help="巡检与报警")
     w.add_argument("--dry-run", action="store_true", help="只打印，不发通知、不改状态")
     w.add_argument("--test-notify", action="store_true", help="只发一条测试通知")
@@ -261,6 +275,7 @@ def main(argv=None) -> None:
     load_env()
     cfg = load_config()
     {"market": cmd_market, "account": cmd_account, "watch": cmd_watch,
+     "live": lambda c, a: __import__("hedgebot.live", fromlist=["execute"]).execute(c, a),
      "rh-keygen": cmd_rh_keygen,
      "paper": cmd_paper}[args.cmd](cfg, args)
 

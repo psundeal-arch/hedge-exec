@@ -16,6 +16,17 @@ class Fees:
     cde_taker: float
     cde_maker: float
     cde_per_contract: float = 0.0     # 美元/张，按张收的固定费
+    coinbase_taker: float = 0.0030
+    coinbase_maker: float = 0.0015
+
+
+@dataclass(frozen=True)
+class Live:
+    max_notional_usd: float = 25000
+    max_wait_s: float = 600
+    reprice_min_s: float = 4
+    poll_s: float = 2
+    taker_slippage_bps: float = 30
 
 
 @dataclass(frozen=True)
@@ -30,6 +41,7 @@ class Config:
     min_alert_usd: float = 200.0
     blind_after: int = 3
     resend_hours: tuple[float, ...] = (1, 3, 6, 12, 24)
+    live: Live = Live()
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -58,6 +70,7 @@ def load_config(path: Path | None = None) -> Config:
         min_alert_usd=float(watch.get("min_alert_usd", 200)),
         blind_after=int(watch.get("blind_after", 3)),
         resend_hours=tuple(float(x) for x in watch.get("resend_hours", (1, 3, 6, 12, 24))),
+        live=Live(**{k: float(v) for k, v in raw.get("live", {}).items()}),
     )
 
 

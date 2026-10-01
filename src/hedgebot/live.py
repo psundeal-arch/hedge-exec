@@ -1,0 +1,252 @@
+"""hedge live：真实开/平仓。默认只预检；--go 才下单，且要在终端里手输确认。
+
+交易 key 放在 .env.trade（只留本机，deploy 不会带上服务器）：
+    COINBASE_TRADE_KEY_NAME / COINBASE_TRADE_PRIVATE_KEY   现货 + CDE 下单
+    KRAKEN_TRADE_KEY / KRAKEN_TRADE_SECRET                 现货在 Kraken 时才需要
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import math
+import os
+import sqlite3
+import sys
+
+from . import coinbase
+from .config import PROJECT_ROOT, Config, load_env
+from .http import SourceError
+from .ladder import Ladder, Params
+from .trade_api import (CoinbaseLeg, KrakenLeg, _CoinbaseAuth, _KrakenAuth,
+                        coinbase_available, kraken_available)
+
+SCHEMA = """
+create table if not exists runs(
+    id integer primary key, started text, ended text, symbol text, action text,
+    spot_venue text, contracts integer, status text, summary text);
+create table if not exists fills(
+    id integer primary key, run_id integer, ts text, venue text, side text,
+    qty real, price real, fee real, order_id text, kind text);
+"""
+
+
+def _env(*names: str) -> tuple[str, ...] | None:
+    vals = tuple(os.environ.get(n, "").strip() for n in names)
+    return vals if all(vals) else None
+
+
+def trade_auths(spot_venue: str, *, need_trade: bool):
+    """返回 (coinbase_auth, kraken_auth, 说明)。预检时没有交易 key 就退回只读 key。"""
+    load_env(PROJECT_ROOT / ".env.trade")
+    notes = []
+    cb = _env("COINBASE_TRADE_KEY_NAME", "COINBASE_TRADE_PRIVATE_KEY")
+    if not cb:
+        if need_trade:
+            raise SystemExit("缺 COINBASE_TRADE_KEY_NAME / COINBASE_TRADE_PRIVATE_KEY（写进 .env.trade）")
+        cb = _env("COINBASE_API_KEY_NAME", "COINBASE_API_PRIVATE_KEY")
+        notes.append("没有 Coinbase 交易 key，用只读 key 预检（下单预检可能被拒）")
+    kr = None
+    if spot_venue == "kraken":
+        kr = _env("KRAKEN_TRADE_KEY", "KRAKEN_TRADE_SECRET")
+        if not kr:
+            if need_trade:
+                raise SystemExit("缺 KRAKEN_TRADE_KEY / KRAKEN_TRADE_SECRET（写进 .env.trade）")
+            kr = _env("KRAKEN_API_KEY", "KRAKEN_API_SECRET")
+            notes.append("没有 Kraken 交易 key，用只读 key 预检（validate 会被拒）")
+    if not cb:
+        raise SystemExit("连只读的 Coinbase key 都没有")
+    return (_CoinbaseAuth(*cb), _KrakenAuth(*kr) if kr else None, notes)
+
+
+def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool):
+    perps = coinbase.cde_perps()
+    p = perps.get(symbol)
+    if not p:
+        raise SystemExit(f"CDE 没有 {symbol} 的永续")
+    cb_auth, kr_auth, notes = trade_auths(spot_venue, need_trade=need_trade)
+    perp = CoinbaseLeg(cb_auth, p["product_id"], is_perp=True)
+    if spot_venue == "coinbase":
+        spot = CoinbaseLeg(cb_auth, f"{symbol}-USD", is_perp=False)
+        avail = lambda: coinbase_available(cb_auth)            # noqa: E731
+        maker = cfg.fees.coinbase_maker
+    else:
+        pair = cfg.symbols.get(symbol)
+        if not pair:
+            raise SystemExit(f"config.toml [symbols] 里没有 {symbol} 的 Kraken 交易对")
+        spot = KrakenLeg(kr_auth, pair)
+        avail = lambda: kraken_available(kr_auth)              # noqa: E731
+        maker = cfg.fees.kraken_maker
+    return p, spot, perp, cb_auth, avail, maker, notes
+
+
+def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
+    """所有能在下单前查的都查一遍。返回计划；有致命问题时 plan['blockers'] 非空。"""
+    sym = args.symbol.upper()
+    p, spot, perp, cb_auth, avail, maker, notes = build(cfg, sym, args.spot, need_trade=need_trade)
+    cs = p["contract_size"]
+    pb, sb = perp.book(), spot.book()
+    if not (pb.mid and sb.mid):
+        raise SystemExit("订单簿是空的（闭市？）")
+    contracts = args.contracts or math.floor(args.usd / (cs * pb.mid))
+    qty = contracts * cs
+    notional = qty * sb.mid
+    blockers, warns = [], list(notes)
+
+    if contracts < 1:
+        blockers.append("不足一张合约")
+    if not p["session_open"] or p["trading_disabled"]:
+        blockers.append("CDE 现在闭市或停牌")
+    if notional > cfg.live.max_notional_usd:
+        blockers.append(f"名义 ${notional:,.0f} 超过上限 ${cfg.live.max_notional_usd:,.0f}"
+                        f"（config.toml [live] max_notional_usd）")
+    if qty < spot.min_qty:
+        blockers.append(f"现货 {qty:g} 低于最小下单量 {spot.min_qty:g}")
+
+    try:
+        bal = avail()
+    except SourceError as e:
+        bal = None
+        blockers.append(f"读不到 {args.spot} 余额：{e}")
+    if bal is not None:
+        if args.action == "open":
+            cash = bal.get("USD", 0) + (bal.get("USDC", 0) if args.spot == "coinbase" else 0)
+            need = notional * (1 + maker) * 1.01
+            if cash < need:
+                blockers.append(f"{args.spot} 可用美元 ${cash:,.2f} < 需要 ${need:,.2f}")
+        else:
+            have = bal.get(sym, 0)
+            if have < qty:
+                blockers.append(f"{args.spot} 可卖 {sym} {have:g} < 要卖 {qty:g}"
+                                f"（Kraken 质押中的不能直接卖，要先解押）")
+
+    # CDE 保证金。只有现金（USD/USDC）计入，【加密现货不算】—— 无论币在 Coinbase
+    # 还是 Kraken。所以在 Coinbase 用 USD 买现货，花掉的那笔钱会直接从 CDE 的
+    # 购买力里扣掉；空单再要一份保证金。按隔夜（更高的那档）保证金率算。
+    if args.action == "open":
+        try:
+            bs = cb_auth.call("GET", "/api/v3/brokerage/cfm/balance_summary",
+                              "CDE 保证金")["balance_summary"]
+            bp = float((bs.get("futures_buying_power") or {}).get("value") or 0)
+            rate = p["margin_short_overnight"] or 0
+            spend = notional if args.spot == "coinbase" else 0.0
+            need = spend + notional * rate
+            warns.append(f"CDE 购买力 ${bp:,.0f}，本笔占用约 ${need:,.0f}"
+                         + (f"（含 Coinbase 买现货花掉的 ${spend:,.0f} 现金）" if spend else ""))
+            if bp < need:
+                blockers.append(
+                    f"CDE 购买力 ${bp:,.0f} < 需要 ${need:,.0f}"
+                    + (f"（Coinbase 买现货花掉 ${spend:,.0f} 现金" if spend else "（")
+                    + f"{' + ' if spend else ''}空单隔夜保证金 {rate*100:.1f}% × ${notional:,.0f}）")
+            elif bp - need < notional * 0.3:
+                warns.append(f"开仓后 CDE 购买力只剩约 ${bp - need:,.0f}，币价上涨 30% 左右就可能"
+                             f"追加保证金 —— 看 perp-track 的强平距离")
+        except SourceError as e:
+            blockers.append(f"读不到 CDE 保证金：{e}")
+
+    if args.action == "close":
+        try:
+            held = sum(r["contracts"] for r in coinbase.positions(cb_auth.key_name, cb_auth.key_secret)
+                       if r["product"] == p["product_id"] and r["side"] == "SHORT")
+            if held < contracts:
+                blockers.append(f"CDE 只有 {held:g} 张空单，要平 {contracts}")
+        except SourceError as e:
+            blockers.append(f"读不到 CDE 持仓：{e}")
+
+    previews = {}
+    for name, leg, side, n in (("CDE", perp, "sell" if args.action == "open" else "buy", contracts),
+                               ("现货", spot, "buy" if args.action == "open" else "sell", qty)):
+        try:
+            pv = leg.preview(side, n)
+            previews[name] = pv
+            if not pv["ok"]:
+                (blockers if need_trade else warns).append(f"{name} 预检未通过：{pv['errors']}")
+        except SourceError as e:
+            (blockers if need_trade else warns).append(f"{name} 预检请求失败：{e}")
+
+    f = cfg.fees
+    spot_fee = notional * maker
+    perp_fee = notional * f.cde_taker + contracts * f.cde_per_contract
+    return {"symbol": sym, "product": p["product_id"], "cs": cs, "contracts": contracts,
+            "qty": qty, "notional": notional, "spot_mid": sb.mid, "perp_mid": pb.mid,
+            "basis": pb.mid / sb.mid - 1, "funding_rate": p["funding_rate"],
+            "spot_fee": spot_fee, "perp_fee": perp_fee, "balances": bal,
+            "previews": previews, "blockers": blockers, "warnings": warns,
+            "legs": (spot, perp)}
+
+
+def print_plan(plan: dict, args) -> None:
+    act = "开仓：买现货 + 卖空" if args.action == "open" else "平仓：卖现货 + 买平空单"
+    print(f"{act}  {plan['symbol']}  现货在 {args.spot}")
+    print(f"  {plan['contracts']} 张 {plan['product']}（每张 {plan['cs']:g}）= {plan['qty']:g} {plan['symbol']}"
+          f" ≈ ${plan['notional']:,.0f}")
+    print(f"  现货中价 {plan['spot_mid']:g}，CDE 中价 {plan['perp_mid']:g}，基差 {plan['basis']*100:+.3f}%")
+    if plan["funding_rate"] is not None:
+        print(f"  资金费 {plan['funding_rate']:g}/小时（年化 {plan['funding_rate']*8760*100:.2f}%）")
+    print(f"  预计手续费：现货挂单 ${plan['spot_fee']:.2f} + CDE 吃单 ${plan['perp_fee']:.2f}"
+          f"（超时改吃单会更贵）")
+    for name, pv in plan["previews"].items():
+        tag = "✓" if pv["ok"] else "✗"
+        print(f"  {name} 交易所预检 {tag}  {pv['errors'] or ''} {pv['warnings'] or ''}")
+    for w in plan["warnings"]:
+        print(f"  · {w}")
+    for b in plan["blockers"]:
+        print(f"  ✗ {b}")
+
+
+def execute(cfg: Config, args) -> None:
+    plan = preflight(cfg, args, need_trade=args.go)
+    print_plan(plan, args)
+    if plan["blockers"]:
+        sys.exit("\n有阻断项，不下单。")
+    if not args.go:
+        print("\n以上是预检，没有下单。确认无误后加 --go 真实执行。")
+        return
+    if not sys.stdin.isatty():
+        sys.exit("真实下单必须在终端里手动确认，不接受管道/脚本输入")
+    want = f"{plan['symbol']} {plan['contracts']}"
+    if input(f"\n真实下单。确认请输入「{want}」：").strip() != want:
+        sys.exit("没确认，不下单")
+
+    db = sqlite3.connect(cfg.db_path.parent / "live.db")
+    db.executescript(SCHEMA)
+    now = lambda: dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")  # noqa: E731
+    run_id = db.execute("insert into runs(started,symbol,action,spot_venue,contracts,status)"
+                        " values(?,?,?,?,?,?)", (now(), plan["symbol"], args.action, args.spot,
+                                                 plan["contracts"], "running")).lastrowid
+    db.commit()
+
+    def on_fill(**f):
+        # 每笔成交立刻落盘 —— 进程中途死掉也能知道到底成交了什么
+        db.execute("insert into fills(run_id,ts,venue,side,qty,price,fee,order_id,kind)"
+                   " values(?,?,?,?,?,?,?,?,?)", (run_id, now(), f["venue"], f["side"], f["qty"],
+                                                  f["price"], f["fee"], f["order_id"], f["kind"]))
+        db.commit()
+
+    spot, perp = plan["legs"]
+    lv = cfg.live
+    ladder = Ladder(spot, perp, action=args.action, contracts=plan["contracts"],
+                    contract_size=plan["cs"], on_fill=on_fill,
+                    params=Params(poll_s=lv.poll_s, reprice_min_s=lv.reprice_min_s,
+                                  max_wait_s=args.max_wait or lv.max_wait_s,
+                                  taker_slippage_bps=lv.taker_slippage_bps, finish=args.finish))
+    print()
+    r = ladder.run()
+    resid = r.residual(plan["cs"])
+    summary = {"spot_qty": r.spot_qty, "spot_avg": r.spot_avg, "spot_fees": r.spot_fees,
+               "contracts": r.contracts, "perp_avg": r.perp_cost / (r.contracts * plan["cs"])
+               if r.contracts else None, "perp_fees": r.perp_fees, "residual": resid,
+               "spot_orders": r.spot_orders}
+    db.execute("update runs set ended=?, status=?, summary=? where id=?",
+               (now(), r.status, json.dumps(summary), run_id))
+    db.commit()
+
+    print(f"\n结果：{r.status}")
+    print(f"  现货 {r.spot_qty:g} @ {r.spot_avg or 0:g}，手续费 ${r.spot_fees:.2f}，挂单 {r.spot_orders} 次")
+    if r.contracts:
+        print(f"  CDE {r.contracts} 张 @ {summary['perp_avg']:g}，手续费 ${r.perp_fees:.2f}")
+        print(f"  成交基差 {(summary['perp_avg'] / r.spot_avg - 1) * 100:+.3f}%" if r.spot_avg else "")
+    if abs(resid) > spot.lot:
+        print(f"  ⚠ 未对冲零头 {resid:+g} {plan['symbol']}（≈ ${abs(resid) * plan['spot_mid']:,.0f}）")
+    if r.status == "aborted":
+        print("  ✗ 空单没跟上，现货已成交部分是裸腿 —— 去 CDE 手动补，或在现货平台卖掉")
+    print("  核对两边：hedge account")

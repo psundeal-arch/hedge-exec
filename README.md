@@ -69,9 +69,27 @@ CDE 手续费 = 比例费 + 每张固定费（2026-10-01 用 91 笔真实 maker 
 - **进程本身崩溃** → `hedge-bot-failed.service` 用裸 curl 发 Pushover，6 小时内最多一次。
 - 通知凭据读 `~/perp-track/.env`，不复制密钥。报警状态在 `data/watch.db`。
 
+## 真实下单（live）
+
+```bash
+hedge live open LTC --spot coinbase --contracts 2        # 只预检：余额、保证金、交易所预检、费用
+hedge live open LTC --spot coinbase --contracts 2 --go   # 真实执行，要手输「LTC 2」确认
+hedge live close LTC --spot kraken --usd 3000 --go
+```
+
+现货挂 post-only 限价单，每成交满一张合约的量就吃单跟进一张 CDE。任意时刻没对冲的敞口不到
+一张。挂单超过 `max_wait_s` 没成交完：`--finish complete`（默认）吃单补齐，`--finish trim`
+把凑不满一张的零头退掉。空单连续 3 次跟不上就撤单停手，并报告裸腿。Ctrl-C 也会先撤单、
+再对冲已成交的整张。每笔成交实时写入 `data/live.db`。
+
+交易 key 放 `.env.trade`，只留本机（deploy 只传 `.env`）。
+
+**保证金：加密现货不计入 CDE 保证金，不管币在 Coinbase 还是 Kraken。** 只有现金
+（USD/USDC）计入。所以 `--spot coinbase` 买现货花掉的 USD 会直接从 CDE 购买力里扣掉；
+`--spot kraken` 不动 Coinbase 的现金。预检会按「花掉的现金 + 空单隔夜保证金」检查购买力。
+币价上涨时现货的浮盈也补不到空单那边，需要手动卖币换 USD 补保证金。
+
 ## 下一步（实盘）
 
-- 加一个 Venue 类实现真实下单：Kraken 走 AddOrder，CDE 走 Advanced Trade `/orders`，
-  这时需要另外申请带交易权限的 key。
-- Kraken 那一腿改成 post-only 限价单，成交后再用市价单对冲 CDE 那一腿。
-- 先用最小规模跑通一次开平，再放大。
+- 先用最小规模（LTC 1 张 ≈ $335）真实跑通一次开、一次平，核对 data/live.db 与交易所记录。
+- Robinhood 现货腿（现有 BTC/ETH/LTC 在那边）还不能自动平仓。
