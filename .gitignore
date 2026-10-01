@@ -1,0 +1,14 @@
+# 密钥与数据 —— 绝不入库
+.env
+.env.*
+!.env.example
+data/
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+.pytest_cache/
+
+.DS_Store

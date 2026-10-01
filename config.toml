@@ -1,0 +1,29 @@
+# 标的 -> Kraken 现货交易对（altname）。
+# CDE 永续不用配：按标的（contract_root_unit）从公开合约列表里自动找，
+# 合约代码带到期日（BIP-20DEC30-CDE），写死了哪天换代就悄悄失效。
+[symbols]
+BTC = "XBTUSD"
+ETH = "ETHUSD"
+SOL = "SOLUSD"
+AVAX = "AVAXUSD"
+LTC = "LTCUSD"
+LINK = "LINKUSD"
+XRP = "XRPUSD"
+DOGE = "XDGUSD"
+
+# 费率按小数写（0.004 = 0.40%）。默认按吃单算 —— 模拟盘是市价成交。
+# Kraken Pro 最低档：maker 0.25% / taker 0.40%（成交量上去会降）。
+# CDE 的值【待核对】：用第一笔真实成交的 commission ÷ 名义敞口校准。
+[fees]
+kraken_taker = 0.0040
+kraken_maker = 0.0025
+cde_taker = 0.0005
+cde_maker = 0.0002
+
+[risk]
+# 任一腿的成交均价偏离中间价超过这么多基点，整笔不做（两腿都不下）
+max_slippage_bps = 30
+# 实盘对齐检查：|现货数量 - 空单数量| / 现货数量 超过这个就标红
+hedge_tolerance = 0.02
+# market / paper open 不指定 --usd 时的单腿规模
+default_usd = 5000
