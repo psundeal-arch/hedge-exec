@@ -95,10 +95,15 @@ def cmd_account(cfg, args) -> None:
         px = r["price"]
         mismatch = abs(r["delta"]) / r["spot"] if r["spot"] > 0 else None
         held = r["asset"] in cfg.hold_only
+        # 名单内且净多：多出的现货是有意的。净空超出容差则不受名单豁免
+        net_short = r["delta"] < 0 and (mismatch is None or mismatch > cfg.hedge_tolerance)
         if held and r["perp"] == 0:
             flag = "有意持有"
+        elif held and not net_short:
+            flag = "✓ 余量有意持有"
         elif held:
-            flag = "⚠ 在有意持有名单里却有空单"
+            flag = "⚠ 空单多于现货"
+            held = False                  # 给出调整建议
         elif r["perp"] == 0:
             # 只有现货、没开空单：没在名单里，列出来但不标红
             flag = "仅现货"

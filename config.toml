@@ -27,6 +27,8 @@ max_slippage_bps = 30
 hedge_tolerance = 0.02
 # market / paper open 不指定 --usd 时的单腿规模
 default_usd = 5000
-# 有意只持有现货、不打算对冲的标的。account 里显示「有意持有」，不给调整建议；
-# 万一在 CDE 上对它开了空单，会反过来标红提醒。
-hold_only = ["PAXG", "DOGE"]
+# 「现货多出空单的部分」是有意持有的标的：
+#   没开空单（PAXG、DOGE）→ 显示「有意持有」
+#   开了空单（BTC）→ 对冲部分照常检查，多出的现货不标红、不给调整建议；
+#   但空单反而多于现货（净空）仍然标红 —— 那不是「持有」能解释的
+hold_only = ["PAXG", "DOGE", "BTC"]
