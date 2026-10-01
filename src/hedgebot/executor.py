@@ -48,10 +48,11 @@ class PaperVenue:
     """按订单簿快照吃单成交。簿子在一笔交易内不变（不模拟自己的冲击被补单）。"""
 
     def __init__(self, name: str, book: Book, fee_rate: float, multiplier: float = 1.0,
-                 available: bool = True, reason: str = ""):
+                 available: bool = True, reason: str = "", per_unit_fee: float = 0.0):
         self.name = name
         self.book = book
         self.fee_rate = fee_rate
+        self.per_unit_fee = per_unit_fee   # 每单位（张）的固定费，CDE 用
         self.multiplier = multiplier       # 永续：每张多少币；现货：1
         self.available = available
         self.reason = reason
@@ -63,7 +64,7 @@ class PaperVenue:
         avg, filled = walk(levels, qty)
         if avg is None or filled + 1e-9 < qty:
             raise ExecError(f"{self.name} 深度不够：要 {qty:g}，只有 {filled:g}")
-        fee = avg * qty * self.multiplier * self.fee_rate
+        fee = avg * qty * self.multiplier * self.fee_rate + qty * self.per_unit_fee
         return Fill(self.name, side, qty, avg, fee, _now())
 
 

@@ -15,6 +15,7 @@ class Fees:
     kraken_maker: float
     cde_taker: float
     cde_maker: float
+    cde_per_contract: float = 0.0     # 美元/张，按张收的固定费
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,10 @@ def load_config(path: Path | None = None) -> Config:
         raw = tomllib.load(f)
     fees = Fees(**{k: float(v) for k, v in raw["fees"].items()})
     for k, v in vars(fees).items():
+        if k == "cde_per_contract":
+            if not 0 <= v < 5:
+                raise ValueError(f"fees.{k} = {v}：是每张多少美元")
+            continue
         # 写成百分数（0.4）而不是小数（0.004）是最容易犯的错，差 100 倍
         if not 0 <= v < 0.02:
             raise ValueError(f"fees.{k} = {v}：应写成小数，0.004 = 0.40%")

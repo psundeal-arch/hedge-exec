@@ -172,7 +172,8 @@ class Paper:
         f = self.cfg.fees
         spot = PaperVenue("kraken", q.spot, f.kraken_taker)
         perp = PaperVenue("cde", q.perp, f.cde_taker, q.contract_size,
-                          available=q.session_open, reason="CDE 闭市或停牌")
+                          available=q.session_open, reason="CDE 闭市或停牌",
+                          per_unit_fee=f.cde_per_contract)
         return spot, perp
 
     def _execute(self, q: Quote, action: str, perp_side: str, contracts: int,

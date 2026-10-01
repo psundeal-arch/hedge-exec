@@ -167,3 +167,13 @@ def test_robinhood_signature_verifies():
     long = base64.b64encode(seed + base64.b64decode(pub)).decode()
     assert robinhood.sign("k1", long, 1700000000, "/x/", "GET") == \
         robinhood.sign("k1", priv, 1700000000, "/x/", "GET")
+
+
+def test_cde_per_contract_fee():
+    from hedgebot.config import Fees
+    v = PaperVenue("cde", Book(bids=((100, 10),), asks=()), 0.001, 5, per_unit_fee=0.1)
+    f = v.market("sell", 3)
+    assert f.fee == pytest.approx(3 * 5 * 100 * 0.001 + 3 * 0.1)
+    base = estimate(quote(), 2, Fees(0.004, 0.0025, 0.0005, 0.0002))
+    with_fixed = estimate(quote(), 2, Fees(0.004, 0.0025, 0.0005, 0.0002, 0.1))
+    assert with_fixed["fees"] - base["fees"] == pytest.approx(2 * 2 * 0.1)   # 开+平 各 2 张

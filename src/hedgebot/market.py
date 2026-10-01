@@ -119,7 +119,10 @@ def estimate(q: Quote, contracts: int, fees: Fees) -> dict:
             return out
         notional = avg * n * mult
         slip += abs(avg - mid) * n * mult
-        fee += notional * (fees.kraken_taker if "spot" in name else fees.cde_taker)
+        if "spot" in name:
+            fee += notional * fees.kraken_taker
+        else:
+            fee += notional * fees.cde_taker + n * fees.cde_per_contract
         out[f"{name}_px"] = avg
     notional = qty * q.spot.mid
     out["notional"] = notional
