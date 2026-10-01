@@ -169,10 +169,19 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
             blockers.append(f"读不到 {args.spot} 余额：{e}")
         if bal is not None:
             if args.action == "open":
-                cash = bal.get("USD", 0) + (bal.get("USDC", 0) if args.spot == "coinbase" else 0)
                 need = notional * (1 + maker) * 1.01
-                if cash < need:
-                    blockers.append(f"{args.spot} 可用美元 ${cash:,.2f} < 需要 ${need:,.2f}")
+                usd, usdc = bal.get("USD", 0), bal.get("USDC", 0)
+                if args.spot == "coinbase" and usd < need <= usdc:
+                    # SYM-USD 只能用 USD 付，不会自动动用 USDC（2026-10-01 加仓第 3 块
+                    # 因此 INSUFFICIENT_FUND）。SYM-USDC 是同一个订单簿的别名，改走它用 USDC 付
+                    spot = CoinbaseLeg(cb_auth, f"{sym}-USDC", is_perp=False)
+                    warns.append(f"USD 可用 ${usd:,.2f} 不够，改用 USDC 支付（{sym}-USDC 与 "
+                                 f"{sym}-USD 是同一个订单簿）")
+                elif args.spot == "kraken" and usd < need:
+                    blockers.append(f"kraken 可用美元 ${usd:,.2f} < 需要 ${need:,.2f}")
+                elif usd < need:
+                    blockers.append(f"coinbase 可用 USD ${usd:,.2f}、USDC ${usdc:,.2f}，"
+                                    f"单一币种都不够 ${need:,.2f} —— 先在 Coinbase 把一部分换成另一种（1:1）")
             else:
                 have = bal.get(sym, 0)
                 if have < qty:
