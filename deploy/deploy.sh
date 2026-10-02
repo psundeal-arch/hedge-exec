@@ -18,8 +18,13 @@ ssh "$TARGET" 'python3 -c "import sys; assert sys.version_info>=(3,11); print(sy
 echo "==> 同步代码"
 rsync -az --delete \
   --exclude '.git/' --exclude '.claude/' --exclude '.pytest_cache/' --exclude '.venv/' \
-  --exclude '__pycache__/' --exclude '*.egg-info/' --exclude '.env' --exclude 'data/' \
+  --exclude '__pycache__/' --exclude '*.egg-info/' --exclude 'data/' \
+  --exclude '.env' --exclude '.env.*' \
   "$LOCAL_DIR"/ "$TARGET:$REMOTE_DIR/"
+
+# 交易 key（.env.trade）【绝不上服务器】。--exclude '.env' 只匹配这一个文件名，
+# 2026-10-02 发现 .env.trade 因此被同步了过去 —— 现在排除 .env.*，并在这里兜底删除
+ssh "$TARGET" "rm -f $REMOTE_DIR/.env.trade $REMOTE_DIR/.env.local"
 
 echo "==> 传 .env（600）"
 scp -q "$LOCAL_DIR/.env" "$TARGET:$REMOTE_DIR/.env"
