@@ -2,7 +2,7 @@
 
   hedge market [SYM ...] [--usd N]     两腿行情、基差、资金费、一轮成本与回本天数
   hedge account                        实盘只读：现货（Kraken + Robinhood）vs CDE 空单是否对齐
-  hedge live open|close SYM --spot coinbase|kraken [--usd N | --contracts N] [--paper | --go]
+  hedge live open|close SYM --spot coinbase|kraken|robinhood --perp cde [--usd N | --contracts N] [--paper | --go]
                                        开平仓：现货挂单 + 空单按成交跟进。默认只预检，
                                        --paper 模拟执行，--go 真实下单
   hedge scan [SYM ...] [--perp-track] [--paper]   批量体检；--paper 逐个模拟实跑开+平
@@ -490,6 +490,9 @@ def main(argv=None) -> None:
     lv.add_argument("symbol")
     # 不给默认值：Coinbase 便宜但买现货的现金会从 CDE 保证金里扣掉，Kraken 不扣 —— 每次自己选
     lv.add_argument("--spot", choices=["coinbase", "kraken", "robinhood"], required=True)
+    # 合约腿也必须写明。现在只有 CDE；以后接 Kraken Futures 就在这里加选项，
+    # 免得命令行里看不出空单开在哪个场所
+    lv.add_argument("--perp", choices=["cde"], required=True, help="合约（空单）腿所在场所")
     g = lv.add_mutually_exclusive_group(required=True)
     g.add_argument("--usd", type=float)
     g.add_argument("--contracts", type=int)

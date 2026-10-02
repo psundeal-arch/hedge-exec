@@ -72,9 +72,10 @@ CDE 手续费 = 比例费 + 每张固定费（2026-10-01 用 91 笔真实 maker 
 ## 真实下单（live）
 
 ```bash
-hedge live open LTC --spot coinbase --contracts 2        # 只预检：余额、保证金、交易所预检、费用
-hedge live open LTC --spot coinbase --contracts 2 --go   # 真实执行，要手输「LTC 2」确认
-hedge live close LTC --spot kraken --usd 3000 --go
+hedge live open LTC --spot coinbase --perp cde --contracts 2        # 只预检：余额、保证金、交易所预检、费用
+hedge live open LTC --spot coinbase --perp cde --contracts 2 --go   # 真实执行，要手输「LTC 2」确认
+hedge live close LTC --spot kraken --perp cde --usd 3000 --go
+hedge live open HBAR --spot robinhood --perp cde --contracts 6 --go   # Robinhood v2：逐张吃单 + 跟进
 ```
 
 现货挂 post-only 限价单，**分块挂**：每块最多 `clip_usd`（$2000，至少一张合约）。每成交满

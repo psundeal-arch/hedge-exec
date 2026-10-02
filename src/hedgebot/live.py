@@ -267,7 +267,7 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
 
 def print_plan(plan: dict, args) -> None:
     act = "开仓：买现货 + 卖空" if args.action == "open" else "平仓：卖现货 + 买平空单"
-    print(f"{act}  {plan['symbol']}  现货在 {args.spot}")
+    print(f"{act}  {plan['symbol']}  现货在 {args.spot}，空单在 {args.perp}")
     print(f"  {plan['contracts']} 张 {plan['product']}（每张 {plan['cs']:g}）= {plan['qty']:g} {plan['symbol']}"
           f" ≈ ${plan['notional']:,.0f}")
     print(f"  现货中价 {plan['spot_mid']:g}，CDE 中价 {plan['perp_mid']:g}，基差 {plan['basis']*100:+.3f}%")
@@ -314,10 +314,15 @@ def _run(cfg: Config, args, plan: dict, *, mode: str) -> None:
         db.execute("alter table runs add column mode text")
     except sqlite3.OperationalError:
         pass                                        # 已经有这一列
+    try:
+        db.execute("alter table runs add column perp_venue text")
+    except sqlite3.OperationalError:
+        pass
     now = lambda: dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")  # noqa: E731
-    run_id = db.execute("insert into runs(started,symbol,action,spot_venue,contracts,status,mode)"
-                        " values(?,?,?,?,?,?,?)", (now(), plan["symbol"], args.action, args.spot,
-                                                   plan["contracts"], "running", mode)).lastrowid
+    run_id = db.execute("insert into runs(started,symbol,action,spot_venue,contracts,status,mode,"
+                        "perp_venue) values(?,?,?,?,?,?,?,?)",
+                        (now(), plan["symbol"], args.action, args.spot, plan["contracts"],
+                         "running", mode, args.perp)).lastrowid
     db.commit()
 
     # 模拟成交同时记进模拟盘，这样 paper status 能看到仓位、watch 会按整点记资金费
