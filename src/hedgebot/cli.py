@@ -489,7 +489,7 @@ def main(argv=None) -> None:
     lv.add_argument("action", choices=["open", "close"])
     lv.add_argument("symbol")
     # 不给默认值：Coinbase 便宜但买现货的现金会从 CDE 保证金里扣掉，Kraken 不扣 —— 每次自己选
-    lv.add_argument("--spot", choices=["coinbase", "kraken"], required=True)
+    lv.add_argument("--spot", choices=["coinbase", "kraken", "robinhood"], required=True)
     g = lv.add_mutually_exclusive_group(required=True)
     g.add_argument("--usd", type=float)
     g.add_argument("--contracts", type=int)

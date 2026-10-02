@@ -263,3 +263,35 @@ def test_kraken_rate_limit_retries_with_fresh_nonce(monkeypatch):
     auth = ta._KrakenAuth("k", "c2VjcmV0")
     assert auth.call("/0/private/QueryOrders", {"txid": "x"}, "t") == {"ok": 1}
     assert len(calls) == 2 and calls[1] > calls[0]
+
+
+class TakerSpot(Spot):
+    """Robinhood 式只吃单的现货腿。take 每次按要求数量全部成交。"""
+    taker_only = True
+
+    def place_post_only(self, *a, **k):
+        raise AssertionError("只吃单的腿不应挂单")
+
+
+def test_taker_only_leg_hedges_one_contract_at_a_time():
+    spot, perp = TakerSpot(), Perp()
+    unhedged = []
+    clk = Clock()
+    ld = Ladder(spot, perp, action="open", contracts=3, contract_size=CS, params=Params(poll_s=1),
+                clock=clk.now, sleep=clk.sleep, say=lambda m: None,
+                on_fill=lambda **f: unhedged.append(ld.r.residual(CS)) if f["venue"] == "cde" else None)
+    r = ld.run()
+    assert r.status == "done" and r.contracts == 3 and r.spot_qty == pytest.approx(15)
+    assert spot.takes == [("buy", 5), ("buy", 5), ("buy", 5)]       # 逐张
+    assert perp.takes == [("sell", 1, perp.takes[0][2])] * 3 or len(perp.takes) == 3
+    assert r.max_unhedged <= CS + 1e-9 and max(unhedged) < 1e-9
+
+
+def test_taker_only_close_and_unwind():
+    r = go(TakerSpot(), Perp(error=True), contracts=2)
+    assert r.status == "unwound" and r.spot_qty == pytest.approx(0)
+    spot = TakerSpot()
+    clk = Clock()
+    r = Ladder(spot, Perp(), action="close", contracts=2, contract_size=CS, params=Params(poll_s=1),
+               clock=clk.now, sleep=clk.sleep, say=lambda m: None).run()
+    assert r.status == "done" and spot.takes == [("sell", 5), ("sell", 5)]

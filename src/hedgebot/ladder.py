@@ -262,6 +262,7 @@ class Ladder:
     # ------------------------------------------------------------ 现货吃单（收尾 / 回滚）
     def _spot_take(self, side: str, qty: float, why: str) -> None:
         """现货吃单，限价逐档放宽（与空单同一套档位）。"""
+        taker_only = getattr(self.spot, "taker_only", False)
         for bps in list(self.p.hedge_escalation_bps) + [MARKET_BPS]:
             qty = round_down(qty, self.spot.lot)
             if qty < self.spot.min_qty:
@@ -271,12 +272,15 @@ class Ladder:
             ref = self._ref(self.spot.book(), side)
             if ref is None:
                 continue
-            st = self.spot.take(side, qty, self._limit(ref, side, bps))
+            # 只吃单的场所（Robinhood）最后一档发真正的市价单：20% 外的限价可能被拒
+            limit = None if (taker_only and bps >= MARKET_BPS) else self._limit(ref, side, bps)
+            st = self.spot.take(side, qty, limit)
             if st.filled > EPS:
                 sign = 1 if side == self.spot_side else -1
                 self.r.spot_qty += sign * st.filled
                 self.r.spot_cost += sign * st.filled * st.avg
                 self.r.spot_fees += st.fee
+                self._track()
                 self.on_fill(venue=self.spot.name, side=side, qty=st.filled, price=st.avg,
                              fee=st.fee, order_id=None, kind="taker")
                 self.say(f"  {why}：现货吃单 {side} {st.filled:g} @ {st.avg:g}")
@@ -316,7 +320,33 @@ class Ladder:
             self.r.status = "done"
 
     # ------------------------------------------------------------ 主循环
+    def _loop_taker(self) -> None:
+        """只吃单的现货腿（Robinhood v2）：每次吃一张合约的量，成交后立刻跟进空单。
+
+        单腿风险 = 一张合约 × 一次下单往返的几秒。比挂单流程短得多：
+        挂单要等别人来成交，等待期间价格怎么走都有可能。
+        """
+        stalls = 0
+        while self.target_qty - self.r.spot_qty >= self.spot.lot / 2:
+            self._hedge()
+            before = self.r.spot_qty
+            step = min(self.target_qty - self.r.spot_qty, self.cs)
+            self._spot_take(self.spot_side, step, f"第 {self.r.contracts + 1} 张")
+            self.r.spot_orders += 1
+            self._hedge()
+            if self.r.spot_qty - before < self.spot.lot / 2:
+                stalls += 1
+                if stalls >= 3:
+                    raise SourceError("现货连续 3 次吃单都没成交")
+                self.sleep(self.p.poll_s)
+            else:
+                stalls = 0
+        self._hedge_all()
+        self.r.status = "done"
+
     def _loop(self) -> None:
+        if getattr(self.spot, "taker_only", False):
+            return self._loop_taker()
         start = self.clock()
         while True:
             self._hedge()

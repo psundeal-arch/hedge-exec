@@ -124,3 +124,84 @@ def fmt_step(x: float, step: float) -> str:
     n = math.floor(x / step + 1e-9) * step
     d = max(0, -int(math.floor(math.log10(step) + 1e-9)))
     return f"{n:.{d}f}"
+
+
+class RobinhoodLeg:
+    """Ladder 的现货腿（Robinhood v2）。只做吃单：v2 现在一律按吃单费率收，
+    挂单省不了钱，反而要排队、撤单、承担更久的单腿风险。
+
+    Ladder 看到 taker_only 就走逐张吃单的流程（见 ladder._loop_taker）。
+    Robinhood 的限价单只有 GTC，没有 IOC —— 所以「带保护价的吃单」实现为：
+    下限价单 → 等几秒 → 没成交完就撤 → 取最终成交量。
+    """
+    taker_only = True
+    min_poll_s = 0.0
+    min_reprice_s = 0.0
+
+    def __init__(self, trader: RHTrader, symbol: str):
+        self.t = trader
+        self.symbol = symbol
+        self.name = "robinhood"
+        p = trader.pair(symbol)
+        self.lot, self.tick = p["step"], p["tick"]
+        self.min_usd = p["min_usd"]
+        self.min_qty = p["step"]
+
+    def book(self):
+        from .book import Book
+        bb = (self.t._call("GET", "/api/v2/crypto/marketdata/best_bid_ask/?"
+                           + urllib.parse.urlencode({"symbol": self.symbol}),
+                           f"Robinhood 盘口 {self.symbol}").get("results") or [{}])[0]
+        bid, ask = float(bb.get("bid") or 0), float(bb.get("ask") or 0)
+        # Robinhood 只给一档（跨合作交易所的最优价），没有深度 —— 数量填一个大数，
+        # 深度由下单后实际成交量说话
+        return Book(bids=((bid, 1e12),) if bid else (), asks=((ask, 1e12),) if ask else ())
+
+    def _state(self, o: dict):
+        from .trade_api import OrderState
+        filled = float(o.get("filled_asset_quantity") or 0)
+        avg = float(o.get("average_price") or 0) or None
+        return OrderState(filled, avg, float(o.get("fee_charged") or 0),
+                          o.get("state") in OPEN_STATES, o.get("state") or "")
+
+    def take(self, side: str, qty: float, limit_px: float | None):
+        qty_str = fmt_step(qty, self.lot)
+        if limit_px is None:
+            o = self.t.place(side, self.symbol, qty_str)
+        else:
+            # 保护价朝更容易成交的方向取整：买单向上、卖单向下
+            import math
+            n = (math.ceil if side == "buy" else math.floor)(limit_px / self.tick - 1e-9 if side == "buy"
+                                                            else limit_px / self.tick + 1e-9)
+            o = self.t.place(side, self.symbol, qty_str, fmt_step(n * self.tick, self.tick))
+        oid = o.get("id")
+        o = self.t.wait(oid, timeout_s=10)
+        if o.get("state") in OPEN_STATES:
+            self.t.cancel(oid)
+            o = self.t.wait(oid, timeout_s=10)
+        return self._state(o)
+
+    def preview(self, side: str, qty: float) -> dict:
+        try:
+            q = self.t.quote(self.symbol, side, qty)
+            return {"ok": True, "errors": [], "warnings": [], "fee": q.get("fee"), "raw": q}
+        except SourceError as e:
+            return {"ok": False, "errors": [str(e)], "warnings": [], "fee": None, "raw": None}
+
+    # Ladder 的挂单接口：taker_only 时不会被调用
+    def place_post_only(self, *a, **k):
+        raise NotImplementedError("Robinhood 腿只做吃单")
+
+    def status(self, *a, **k):
+        raise NotImplementedError("Robinhood 腿只做吃单")
+
+    def cancel(self, *a, **k):
+        raise NotImplementedError("Robinhood 腿只做吃单")
+
+
+def rh_available(trader: RHTrader) -> dict[str, float]:
+    """USD 购买力 + 各币可卖数量（与 kraken_available / coinbase_available 同形状）。"""
+    from .robinhood import holdings
+    out = {"USD": float(trader.account().get("buying_power") or 0)}
+    out.update(holdings(trader.api_key, trader.secret))
+    return out

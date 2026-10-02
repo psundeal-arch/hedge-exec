@@ -18,6 +18,7 @@ from . import coinbase
 from .config import PROJECT_ROOT, Config, load_env
 from .http import SourceError
 from .ladder import Ladder, Params
+from .rh_trade import RHTrader, RobinhoodLeg, rh_available
 from .paper_legs import PaperPerpLeg, PaperSpotLeg, coinbase_trades, kraken_trades
 from .trade_api import (CoinbaseLeg, KrakenLeg, _CoinbaseAuth, _KrakenAuth,
                         coinbase_available, kraken_available)
@@ -76,6 +77,25 @@ def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool, paper:
         spot = CoinbaseLeg(cb_auth, f"{symbol}-USD", is_perp=False)
         avail = lambda: coinbase_available(cb_auth)            # noqa: E731
         maker = cfg.fees.coinbase_maker
+    elif spot_venue == "robinhood":
+        # Robinhood 的盘口接口也要签名，所以模拟盘同样需要 key（只读即可）
+        load_env(PROJECT_ROOT / ".env.trade")
+        rk = _env("RH_TRADE_API_KEY", "RH_TRADE_PRIVATE_KEY")
+        if not rk:
+            if need_trade:
+                raise SystemExit("缺 RH_TRADE_API_KEY / RH_TRADE_PRIVATE_KEY —— 先 hedge rh-keygen --trade")
+            rk = _env("RH_API_KEY", "RH_PRIVATE_KEY")
+            notes.append("没有 Robinhood 交易 key，用只读 key（报价可能读不到）")
+        if not rk:
+            raise SystemExit("没有 Robinhood key")
+        rht = RHTrader(*rk)
+        spot = RobinhoodLeg(rht, f"{symbol}-USD")
+        avail = lambda: rh_available(rht)                      # noqa: E731
+        # v2 一律按吃单收；费率按账户当前档位（30 天量决定），读不到就按 0.15%
+        try:
+            maker = float((rht.account().get("fee_tier_status") or {}).get("fee_ratio") or 0.0015)
+        except Exception:                                          # noqa: BLE001
+            maker = 0.0015
     else:
         pair = cfg.symbols.get(symbol)
         if not pair:
@@ -85,11 +105,14 @@ def build(cfg: Config, symbol: str, spot_venue: str, *, need_trade: bool, paper:
         maker = cfg.fees.kraken_maker
     if paper:
         f = cfg.fees
-        taker = f.coinbase_taker if spot_venue == "coinbase" else f.kraken_taker
+        taker = {"coinbase": f.coinbase_taker, "kraken": f.kraken_taker}.get(spot_venue, maker)
         # 先把代码绑定下来 —— 下一行 spot 就被换成模拟腿了，闭包里不能再引用它
-        ident = spot.product_id if spot_venue == "coinbase" else spot.pair
-        trades = ((lambda: coinbase_trades(ident)) if spot_venue == "coinbase"
-                  else (lambda: kraken_trades(ident)))
+        if spot_venue == "robinhood":
+            trades = lambda: []                                # noqa: E731 —— 只吃单，用不到成交流
+        else:
+            ident = spot.product_id if spot_venue == "coinbase" else spot.pair
+            trades = ((lambda: coinbase_trades(ident)) if spot_venue == "coinbase"
+                      else (lambda: kraken_trades(ident)))
         spot = PaperSpotLeg(spot, maker_fee=maker, taker_fee=taker, trades_fn=trades)
         perp = PaperPerpLeg(perp, contract_size=p["contract_size"], taker_fee=f.cde_taker,
                             per_contract=f.cde_per_contract)
@@ -177,8 +200,8 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
                     spot = CoinbaseLeg(cb_auth, f"{sym}-USDC", is_perp=False)
                     warns.append(f"USD 可用 ${usd:,.2f} 不够，改用 USDC 支付（{sym}-USDC 与 "
                                  f"{sym}-USD 是同一个订单簿）")
-                elif args.spot == "kraken" and usd < need:
-                    blockers.append(f"kraken 可用美元 ${usd:,.2f} < 需要 ${need:,.2f}")
+                elif args.spot in ("kraken", "robinhood") and usd < need:
+                    blockers.append(f"{args.spot} 可用美元 ${usd:,.2f} < 需要 ${need:,.2f}")
                 elif usd < need:
                     blockers.append(f"coinbase 可用 USD ${usd:,.2f}、USDC ${usdc:,.2f}，"
                                     f"单一币种都不够 ${need:,.2f} —— 先在 Coinbase 把一部分换成另一种（1:1）")
@@ -250,8 +273,12 @@ def print_plan(plan: dict, args) -> None:
     print(f"  现货中价 {plan['spot_mid']:g}，CDE 中价 {plan['perp_mid']:g}，基差 {plan['basis']*100:+.3f}%")
     if plan["funding_rate"] is not None:
         print(f"  资金费 {plan['funding_rate']:g}/小时（年化 {plan['funding_rate']*8760*100:.2f}%）")
-    print(f"  预计手续费：现货挂单 ${plan['spot_fee']:.2f} + CDE 吃单 ${plan['perp_fee']:.2f}"
-          f"（超时改吃单会更贵）")
+    if args.spot == "robinhood":
+        print(f"  预计手续费：现货吃单（Robinhood 费率档）${plan['spot_fee']:.2f}"
+              f" + CDE 吃单 ${plan['perp_fee']:.2f}")
+    else:
+        print(f"  预计手续费：现货挂单 ${plan['spot_fee']:.2f} + CDE 吃单 ${plan['perp_fee']:.2f}"
+              f"（超时改吃单会更贵）")
     for name, pv in plan["previews"].items():
         tag = "✓" if pv["ok"] else "✗"
         print(f"  {name} 交易所预检 {tag}  {pv['errors'] or ''} {pv['warnings'] or ''}")
@@ -338,7 +365,8 @@ def _run(cfg: Config, args, plan: dict, *, mode: str) -> None:
     db.commit()
 
     print(f"\n结果：{r.status}{'（模拟）' if mode == 'paper' else ''}")
-    print(f"  现货 {r.spot_qty:g} @ {r.spot_avg or 0:g}，手续费 ${r.spot_fees:.2f}，挂单 {r.spot_orders} 次")
+    print(f"  现货 {r.spot_qty:g} @ {r.spot_avg or 0:g}，手续费 ${r.spot_fees:.2f}，"
+          f"{'下单' if args.spot == 'robinhood' else '挂单'} {r.spot_orders} 次")
     if r.contracts:
         print(f"  CDE {r.contracts} 张 @ {summary['perp_avg']:g}，手续费 ${r.perp_fees:.2f}")
         print(f"  成交基差 {(summary['perp_avg'] / r.spot_avg - 1) * 100:+.3f}%" if r.spot_avg else "")
