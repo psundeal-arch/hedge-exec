@@ -185,3 +185,41 @@ def test_price_unit_from_display_name():
     assert price_unit({"display_name": "1000SHIB PERP", "future_product_details": {}}) == 1000
     assert price_unit({"future_product_details": {"contract_display_name": "BTC PERP"}}) == 1
     assert price_unit({"future_product_details": {"contract_display_name": "ZCASH PERP"}}) == 1
+
+
+def test_robinhood_doc_signature_vector():
+    """官方文档的签名示例（它拼的是 dict 的 str()，真实请求我们签 JSON 原文）。"""
+    from hedgebot.robinhood import sign
+    body = {"client_order_id": "131de903-5a9c-4260-abc1-28d562a5dcf0", "side": "buy",
+            "symbol": "BTC-USD", "type": "market", "market_order_config": {"asset_quantity": "0.1"}}
+    assert sign("rh-api-6148effc-c0b1-486c-8940-a1d099456be6",
+                "xQnTJVeQLmw1/Mg2YimEViSpw/SdJcgNXZ5kQkAXNPU=", 1698708981,
+                "/api/v1/crypto/trading/orders/", "POST", str(body)) == \
+        "q/nEtxp/P2Or3hph3KejBqnw5o9qeuQ+hYRnB56FaHbjDsNUY9KhB1asMxohDnzdVFSD7StaTqjSd9U9HvaRAw=="
+
+
+def test_rh_signs_exact_bytes_sent(monkeypatch):
+    import base64, json
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    import hedgebot.rh_trade as rt
+    from hedgebot.robinhood import keygen
+    priv, pub = keygen()
+    seen = {}
+
+    def fake_request(method, url, label, **kw):
+        seen.update(kw)
+        return {"id": "x", "state": "filled"}
+    monkeypatch.setattr(rt, "request", fake_request)
+    rt.RHTrader("k1", priv).place("buy", "DOGE-USD", "3190")
+    h, raw = seen["headers"], seen["data"]
+    assert json.loads(raw)["market_order_config"] == {"asset_quantity": "3190"}
+    msg = f"k1{h['x-timestamp']}/api/v1/crypto/trading/orders/POST{raw}".encode()
+    Ed25519PublicKey.from_public_bytes(base64.b64decode(pub)).verify(
+        base64.b64decode(h["x-signature"]), msg)
+
+
+def test_fmt_step():
+    from hedgebot.rh_trade import fmt_step
+    assert fmt_step(3190.7, 1) == "3190"
+    assert fmt_step(0.123456789, 0.00000001) == "0.12345678"
+    assert fmt_step(0.0954399, 0.000001) == "0.095439"

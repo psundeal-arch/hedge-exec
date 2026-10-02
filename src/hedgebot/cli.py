@@ -8,6 +8,7 @@
   hedge scan [SYM ...] [--perp-track] [--paper]   批量体检；--paper 逐个模拟实跑开+平
   hedge watch [--dry-run]              巡检：对齐报警 + 模拟盘记资金费（timer 每 15 分钟跑）
   hedge import-cb-key ~/Downloads/xxx.json   导入 Coinbase 交易 key 到 .env.trade
+  hedge rh-order buy|sell SYM --qty N [--limit P] [--go]   Robinhood 现货下单（默认只预检）
   hedge rh-keygen                      生成 Robinhood API 密钥对：私钥写进 .env，打印公钥
   hedge paper open SYM [--usd N | --contracts N]
   hedge paper close SYM [--pct P]
@@ -230,27 +231,154 @@ def cmd_import_cb_key(cfg, args) -> None:
 
 # ----------------------------------------------------------------- rh-keygen
 def cmd_rh_keygen(cfg, args) -> None:
-    """私钥直接写进 .env（600），屏幕上只出现公钥 —— 私钥不经过终端回显和剪贴板。"""
+    """私钥直接写进文件（600），屏幕上只出现公钥 —— 私钥不经过终端回显和剪贴板。
+
+    默认生成只读 key（写 .env，服务器巡检也用它）；--trade 生成下单 key（写 .env.trade，
+    只留本机，deploy 不会带上服务器）。两把分开：服务器被攻破也下不了单。
+    """
     import os
     from .config import PROJECT_ROOT
     from .robinhood import keygen
-    env = PROJECT_ROOT / ".env"
+    env = PROJECT_ROOT / (".env.trade" if args.trade else ".env")
+    kname, pname = (("RH_TRADE_API_KEY", "RH_TRADE_PRIVATE_KEY") if args.trade
+                    else ("RH_API_KEY", "RH_PRIVATE_KEY"))
     text = env.read_text() if env.exists() else ""
-    if "RH_PRIVATE_KEY=" in text and not args.force:
-        line = next(l for l in text.splitlines() if l.startswith("RH_PRIVATE_KEY="))
-        if line.split("=", 1)[1].strip():
-            sys.exit(".env 里已有 RH_PRIVATE_KEY。要换新的加 --force"
-                     "（旧 key 在 Robinhood 上记得删掉）")
+    old = next((l for l in text.splitlines() if l.startswith(pname + "=")), "")
+    if old.split("=", 1)[-1].strip() and not args.force:
+        sys.exit(f"{env.name} 里已有 {pname}。要换新的加 --force（旧 key 在 Robinhood 上记得删掉）")
     priv, pub = keygen()
-    lines = [l for l in text.splitlines() if not l.startswith("RH_PRIVATE_KEY=")]
-    if not any(l.startswith("RH_API_KEY=") for l in lines):
-        lines.append("RH_API_KEY=")
-    lines.append(f"RH_PRIVATE_KEY={priv}")
+    lines = [l for l in text.splitlines() if not l.startswith(pname + "=")]
+    if not any(l.startswith(kname + "=") for l in lines):
+        lines.append(f"{kname}=")
+    lines.append(f"{pname}={priv}")
     env.write_text("\n".join(lines) + "\n")
     os.chmod(env, 0o600)
-    print("私钥已写入 .env（600 权限）。把下面这个【公钥】贴到 Robinhood：\n")
+    print(f"私钥已写入 {env.name}（600 权限）。把下面这个【公钥】贴到 Robinhood：\n")
     print(f"    {pub}\n")
-    print("Robinhood 生成 key 后，把它给你的 API key 填进 .env 的 RH_API_KEY=")
+    if args.trade:
+        print("权限勾：Place crypto orders without fee tiers (v1)、Read crypto accounts、"
+              "Read crypto holdings、Read crypto orders、Read crypto quotes、Read crypto products")
+    print(f"Robinhood 生成 key 后，把它给你的 API key 填进 {env.name} 的 {kname}=")
+
+
+# ----------------------------------------------------------------- rh-order
+def cmd_rh_order(cfg, args) -> None:
+    """Robinhood 现货下单。默认只预检；--go 真实下单（终端手输确认）。"""
+    import datetime as dt
+    import json
+    import os
+    import sqlite3
+    from .config import PROJECT_ROOT
+    from .http import SourceError
+    from .rh_trade import RHTrader, fmt_step
+    load_env(PROJECT_ROOT / ".env.trade")
+    sym, side = args.symbol.upper(), args.side
+    pair_sym = f"{sym}-USD"
+    key, sec = os.environ.get("RH_TRADE_API_KEY"), os.environ.get("RH_TRADE_PRIVATE_KEY")
+    notes, blockers = [], []
+    if not (key and sec):
+        if args.go:
+            sys.exit("缺 RH_TRADE_API_KEY / RH_TRADE_PRIVATE_KEY —— 先 hedge rh-keygen --trade")
+        key, sec = os.environ.get("RH_API_KEY"), os.environ.get("RH_PRIVATE_KEY")
+        notes.append("没有 Robinhood 交易 key，用只读 key 预检（报价/规格可能因权限不足读不到）")
+    if not (key and sec):
+        sys.exit("连只读的 Robinhood key 都没有")
+    t = RHTrader(key, sec)
+
+    try:
+        pr = t.pair(pair_sym)
+        qty_str = fmt_step(args.qty, pr["step"])
+        qty = float(qty_str)
+        if not pr["min"] <= qty <= pr["max"]:
+            blockers.append(f"数量 {qty_str} 超出 {pr['min']:g}–{pr['max']:g}")
+    except SourceError as e:
+        pr, qty_str, qty = None, f"{args.qty:g}", args.qty
+        blockers.append(f"读不到 {pair_sym} 交易规格：{e}")
+    try:
+        q = t.quote(pair_sym, side, qty)
+    except SourceError as e:
+        q = None
+        blockers.append(f"读不到报价：{e}")
+    notional = qty * q["price"] if q else None
+    if notional and notional > cfg.live.max_notional_usd:
+        blockers.append(f"金额 ${notional:,.0f} 超过上限 ${cfg.live.max_notional_usd:,.0f}")
+    limit_str = None
+    if args.limit is not None:
+        limit_str = fmt_step(args.limit, pr["tick"]) if pr else f"{args.limit:g}"
+    if side == "buy" and notional:
+        try:
+            bp = float(t.account().get("buying_power") or 0)
+            if bp < notional * 1.01:
+                blockers.append(f"Robinhood 购买力 ${bp:,.2f} < 约需 ${notional * 1.01:,.2f}")
+        except SourceError as e:
+            notes.append(f"读不到购买力：{e}")
+
+    # 下单前后的对冲状态：这一笔是补齐对冲，还是把它打歪
+    try:
+        rows, _, errs = hedge_table(coinbase.cde_perps())
+        row = next((r for r in rows if r["asset"] == sym), None)
+        if row and not errs:
+            after = dict(row, spot=row["spot"] + (qty if side == "buy" else -qty))
+            after["delta"] = after["spot"] + after["perp"]
+            b, a = classify([row], cfg)[0], classify([after], cfg)[0]
+            hedge_line = (f"  对冲：现货 {row['spot']:g} → {after['spot']:g}，CDE {row['perp']:g}，"
+                          f"净 {b['delta']:+g} → {a['delta']:+g}（{a['flag']}）")
+        else:
+            hedge_line = "  对冲：读不全持仓，下单前后对冲状态没算"
+    except SourceError:
+        hedge_line = "  对冲：读不全持仓，下单前后对冲状态没算"
+
+    print(f"Robinhood {'买入' if side == 'buy' else '卖出'} {qty_str} {sym}"
+          f"（{'限价 ' + limit_str if limit_str else '市价'}）")
+    if q:
+        sp = f"，价差 {q['spread'] * 100:.2f}%" if q["spread"] is not None else ""
+        print(f"  预估成交价 {q['price']:g}（中价 {q['mid']:g}{sp}）≈ ${notional:,.2f}")
+        print("  Robinhood v1 不另收手续费，成本在价差里")
+    print(hedge_line)
+    for n in notes:
+        print(f"  · {n}")
+    for b in blockers:
+        print(f"  ✗ {b}")
+    if blockers:
+        sys.exit("\n有阻断项，不下单。")
+    if not args.go:
+        print("\n以上是预检，没有下单。确认无误后加 --go 真实执行。")
+        return
+    if not sys.stdin.isatty():
+        sys.exit("真实下单必须在终端里手动确认")
+    want = f"{side.upper()} {sym} {qty_str}"
+    if input(f"\n真实下单。确认请输入「{want}」：").strip() != want:
+        sys.exit("没确认，不下单")
+
+    o = t.place(side, pair_sym, qty_str, limit_str)
+    oid = o.get("id")
+    print(f"已提交，订单 {oid}，状态 {o.get('state')}")
+    o = t.wait(oid) if oid else o
+    filled = float(o.get("filled_asset_quantity") or 0)
+    avg = float(o.get("average_price") or 0)
+    print(f"结果：{o.get('state')}，成交 {filled:g} {sym} @ {avg:g}"
+          + (f" ≈ ${filled * avg:,.2f}" if filled else ""))
+    if o.get("state") in ("open", "pending", "partially_filled"):
+        print("  还没成交完（限价单会一直挂着）—— 在 Robinhood app 里看/撤")
+
+    db = sqlite3.connect(cfg.db_path.parent / "live.db")
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    db.execute("create table if not exists runs(id integer primary key, started text, ended text,"
+               " symbol text, action text, spot_venue text, contracts integer, status text,"
+               " summary text, mode text)")
+    db.execute("create table if not exists fills(id integer primary key, run_id integer, ts text,"
+               " venue text, side text, qty real, price real, fee real, order_id text, kind text)")
+    rid = db.execute("insert into runs(started,ended,symbol,action,spot_venue,contracts,status,"
+                     "summary,mode) values(?,?,?,?,?,?,?,?,?)",
+                     (now, now, sym, f"rh-{side}", "robinhood", 0, o.get("state"),
+                      json.dumps({"order_id": oid, "qty": qty_str, "limit": limit_str}), "live")).lastrowid
+    if filled:
+        db.execute("insert into fills(run_id,ts,venue,side,qty,price,fee,order_id,kind)"
+                   " values(?,?,?,?,?,?,?,?,?)", (rid, now, "robinhood", side, filled, avg,
+                                                  float(o.get("fee_charged") or 0), oid,
+                                                  "limit" if limit_str else "market"))
+    db.commit()
+    print("核对两边：hedge account")
 
 
 # ----------------------------------------------------------------- paper
@@ -377,6 +505,13 @@ def main(argv=None) -> None:
     ik.add_argument("path")
     k = sub.add_parser("rh-keygen", help="生成 Robinhood API 密钥对")
     k.add_argument("--force", action="store_true")
+    k.add_argument("--trade", action="store_true", help="生成下单 key（写 .env.trade）")
+    ro = sub.add_parser("rh-order", help="Robinhood 现货下单（默认只预检）")
+    ro.add_argument("side", choices=["buy", "sell"])
+    ro.add_argument("symbol")
+    ro.add_argument("--qty", type=float, required=True, help="币的数量")
+    ro.add_argument("--limit", type=float, help="限价；不给就是市价单")
+    ro.add_argument("--go", action="store_true", help="真实下单（会要求手输确认）")
     p = sub.add_parser("paper", help="模拟盘")
     ps = p.add_subparsers(dest="action", required=True)
     o = ps.add_parser("open")
@@ -397,7 +532,7 @@ def main(argv=None) -> None:
     cfg = load_config()
     {"market": cmd_market, "account": cmd_account, "watch": cmd_watch, "scan": cmd_scan,
      "live": lambda c, a: __import__("hedgebot.live", fromlist=["execute"]).execute(c, a),
-     "rh-keygen": cmd_rh_keygen, "import-cb-key": cmd_import_cb_key,
+     "rh-keygen": cmd_rh_keygen, "rh-order": cmd_rh_order, "import-cb-key": cmd_import_cb_key,
      "paper": cmd_paper}[args.cmd](cfg, args)
 
 
