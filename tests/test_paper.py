@@ -207,13 +207,17 @@ def test_rh_signs_exact_bytes_sent(monkeypatch):
     seen = {}
 
     def fake_request(method, url, label, **kw):
-        seen.update(kw)
+        if url.endswith("/accounts/"):
+            return {"results": [{"account_number": "A1", "status": "active"}]}
+        seen.update(kw, url=url)
         return {"id": "x", "state": "filled"}
     monkeypatch.setattr(rt, "request", fake_request)
     rt.RHTrader("k1", priv).place("buy", "DOGE-USD", "3190")
     h, raw = seen["headers"], seen["data"]
     assert json.loads(raw)["market_order_config"] == {"asset_quantity": "3190"}
-    msg = f"k1{h['x-timestamp']}/api/v1/crypto/trading/orders/POST{raw}".encode()
+    # v2：account_number 在查询串里，而且是签名原文 path 的一部分
+    assert seen["url"].endswith("/api/v2/crypto/trading/orders/?account_number=A1")
+    msg = f"k1{h['x-timestamp']}/api/v2/crypto/trading/orders/?account_number=A1POST{raw}".encode()
     Ed25519PublicKey.from_public_bytes(base64.b64decode(pub)).verify(
         base64.b64decode(h["x-signature"]), msg)
 

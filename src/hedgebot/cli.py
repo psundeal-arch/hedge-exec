@@ -256,7 +256,7 @@ def cmd_rh_keygen(cfg, args) -> None:
     print(f"私钥已写入 {env.name}（600 权限）。把下面这个【公钥】贴到 Robinhood：\n")
     print(f"    {pub}\n")
     if args.trade:
-        print("权限勾：Place crypto orders without fee tiers (v1)、Read crypto accounts、"
+        print("权限勾：Place crypto orders with fee tiers (v2)、Read crypto accounts、"
               "Read crypto holdings、Read crypto orders、Read crypto quotes、Read crypto products")
     print(f"Robinhood 生成 key 后，把它给你的 API key 填进 {env.name} 的 {kname}=")
 
@@ -289,8 +289,8 @@ def cmd_rh_order(cfg, args) -> None:
         pr = t.pair(pair_sym)
         qty_str = fmt_step(args.qty, pr["step"])
         qty = float(qty_str)
-        if not pr["min"] <= qty <= pr["max"]:
-            blockers.append(f"数量 {qty_str} 超出 {pr['min']:g}–{pr['max']:g}")
+        if qty <= 0 or qty > pr["max"]:
+            blockers.append(f"数量 {qty_str} 超出 0–{pr['max']:g}")
     except SourceError as e:
         pr, qty_str, qty = None, f"{args.qty:g}", args.qty
         blockers.append(f"读不到 {pair_sym} 交易规格：{e}")
@@ -300,6 +300,8 @@ def cmd_rh_order(cfg, args) -> None:
         q = None
         blockers.append(f"读不到报价：{e}")
     notional = qty * q["price"] if q else None
+    if notional is not None and pr and notional < pr["min_usd"]:
+        blockers.append(f"金额 ${notional:.2f} 低于最小下单金额 ${pr['min_usd']:g}")
     if notional and notional > cfg.live.max_notional_usd:
         blockers.append(f"金额 ${notional:,.0f} 超过上限 ${cfg.live.max_notional_usd:,.0f}")
     limit_str = None
@@ -308,7 +310,8 @@ def cmd_rh_order(cfg, args) -> None:
     if side == "buy" and notional:
         try:
             bp = float(t.account().get("buying_power") or 0)
-            if bp < notional * 1.01:
+            fee = float(q.get("fee") or 0)
+            if bp < (notional + fee) * 1.01:
                 blockers.append(f"Robinhood 购买力 ${bp:,.2f} < 约需 ${notional * 1.01:,.2f}")
         except SourceError as e:
             notes.append(f"读不到购买力：{e}")
@@ -331,9 +334,14 @@ def cmd_rh_order(cfg, args) -> None:
     print(f"Robinhood {'买入' if side == 'buy' else '卖出'} {qty_str} {sym}"
           f"（{'限价 ' + limit_str if limit_str else '市价'}）")
     if q:
-        sp = f"，价差 {q['spread'] * 100:.2f}%" if q["spread"] is not None else ""
+        sp = f"，盘口价差 {q['spread'] * 100:.3f}%" if q["spread"] is not None else ""
         print(f"  预估成交价 {q['price']:g}（中价 {q['mid']:g}{sp}）≈ ${notional:,.2f}")
-        print("  Robinhood v1 不另收手续费，成本在价差里")
+        if q.get("fee_ratio") is not None:
+            ft = t.account().get("fee_tier_status") or {}
+            print(f"  手续费 {float(q['fee_ratio']) * 100:.3f}% ≈ ${float(q['fee'] or 0):.2f}"
+                  f"（30 天量 ${float(ft.get('thirty_day_volume') or 0):,.0f}；"
+                  f"下一档 {float(ft.get('next_fee_tier_ratio') or 0) * 100:.3f}% 还差 "
+                  f"${float(ft.get('next_fee_tier_threshold') or 0):,.0f}）")
     print(hedge_line)
     for n in notes:
         print(f"  · {n}")
