@@ -72,3 +72,24 @@ def test_classify_problem_rules():
 def test_hold_only_net_short_still_alerts():
     r = classify([row("BTC", 0.05, -0.06, px=84000)], cfg())[0]
     assert r["flag"] == "⚠ 空单多于现货" and r["problem"]
+
+
+def test_cde_funding_table_uses_averages(monkeypatch, tmp_path):
+    import sqlite3, datetime as dt
+    import hedgebot.scan as sc
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    db = tmp_path / "p.db"
+    con = sqlite3.connect(db)
+    con.execute("create table funding_rates(ts text, product text, apr real, session_open real)")
+    for h in range(30):
+        con.execute("insert into funding_rates values(?,?,?,?)",
+                    ((now - dt.timedelta(hours=h)).isoformat(), "NER-X", -12.0, 1))
+    con.commit()
+    monkeypatch.setattr(sc.coinbase, "cde_perps", lambda: {"NEAR": {
+        "product_id": "NER-X", "funding_rate": 2e-5, "contract_size": 100, "index_price": 2.0,
+        "open_interest": 1000, "margin_short_overnight": 0.5, "session_open": True}})
+    rows, meta = sc.cde_funding_table(db)
+    r = rows[0]
+    assert r["apr_24h"] == -12.0 and r["apr_7d"] == -12.0
+    assert r["apr_now"] > 0                       # 当前为正、均值为负 → 输出里会标成噪音
+    assert r["oi_usd"] == 1000 * 100 * 2.0 and meta["span"] is not None

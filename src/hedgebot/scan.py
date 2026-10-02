@@ -155,3 +155,30 @@ def paper_sweep(cfg: Config, symbols: list[str], *, max_wait: float, say=print) 
             row["error"] = f"{type(e).__name__}: {e}"
             say(f"  {s}: ✗ {row['error']}")
     return out
+
+
+def cde_funding_table(db_path: Path | None) -> tuple[list[dict], dict]:
+    """CDE 全部永续的资金费：当前、24h、7d 均值 + OI、保证金率。只含美国能交易的市场。
+
+    返回 (行, 元信息)。元信息里有样本的时间跨度，供输出提示「7d 其实只有几天」。
+    """
+    perps = coinbase.cde_perps()
+    avgs = funding_avgs(db_path)
+    span = None
+    if db_path and Path(db_path).exists():
+        lo, hi = sqlite3.connect(db_path).execute(
+            "select min(ts), max(ts) from funding_rates").fetchone()
+        if lo and hi:
+            span = (dt.datetime.fromisoformat(lo), dt.datetime.fromisoformat(hi))
+    rows = []
+    for root, p in perps.items():
+        a = avgs.get(p["product_id"], {})
+        cur = (p["funding_rate"] or 0) * 8760 * 100 if p["funding_rate"] is not None else None
+        per_contract = p["contract_size"] * (p["index_price"] or 0)
+        rows.append({"symbol": root, "product": p["product_id"], "apr_now": cur,
+                     "apr_24h": a.get("24h"), "apr_7d": a.get("7d"), "n24": a.get("n24", 0),
+                     "oi_usd": (p["open_interest"] or 0) * per_contract,
+                     "per_contract": per_contract,
+                     "margin_short": p["margin_short_overnight"],
+                     "session_open": p["session_open"]})
+    return rows, {"span": span}

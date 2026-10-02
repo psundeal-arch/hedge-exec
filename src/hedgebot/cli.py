@@ -5,6 +5,7 @@
   hedge live open|close SYM --spot coinbase|kraken|robinhood --perp cde [--usd N | --contracts N] [--paper | --go]
                                        开平仓：现货挂单 + 空单按成交跟进。默认只预检，
                                        --paper 模拟执行，--go 真实下单
+  hedge funding [--sign neg|pos|all] [--min-oi N] [--top N]   CDE 资金费排行（美国可交易）
   hedge scan [SYM ...] [--perp-track] [--paper]   批量体检；--paper 逐个模拟实跑开+平
   hedge watch [--dry-run]              巡检：对齐报警 + 模拟盘记资金费（timer 每 15 分钟跑）
   hedge import-cb-key ~/Downloads/xxx.json   导入 Coinbase 交易 key 到 .env.trade
@@ -181,6 +182,75 @@ def cmd_scan(cfg, args) -> None:
     print("\n实际一轮成本 = (两轮手续费) ÷ 名义 − 基差收益（开仓基差 − 平仓基差）。"
           "模拟挂单成交偏乐观（不考虑同价排队）。")
     (cfg.db_path.parent / f"sweep-{stamp}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1))
+
+
+# ----------------------------------------------------------------- funding
+def cmd_funding(cfg, args) -> None:
+    """CDE（美国能交易的永续）资金费排行。默认只列均值为负的。
+
+    均值来自 perp-track 每小时采样。默认先从服务器拉一份数据库副本（只读）——
+    本机那份可能停了几个小时、合约也不全；拉不到就退回本机，并在输出里说明。
+    Kraken 国际站的 PF_ 合约不列：platformsPermitted 里没有美国平台，美国账户交易不了。
+    """
+    import csv
+    import datetime as dt
+    import subprocess
+    from .scan import cde_funding_table
+    db = Path(args.funding_db).expanduser() if args.funding_db else None
+    src = str(db) if db else ""
+    if db is None and args.server:
+        cache = cfg.db_path.parent / "perp-server.db"
+        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                            f"{args.server}:perp-track/perp.db", str(cache)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            db, src = cache, f"{args.server}（刚拉取）"
+    if db is None:
+        db, src = PERP_TRACK / "perp.db", "本机 perp-track（可能不是最新）"
+    rows, meta = cde_funding_table(db)
+
+    def key(r):          # 最长可用窗口的均值；都没有就用当前值
+        return next((r[k] for k in ("apr_7d", "apr_24h", "apr_now") if r[k] is not None), 0)
+    rows = [r for r in rows if r["oi_usd"] >= args.min_oi]
+    if args.sign == "neg":
+        rows = [r for r in rows if key(r) < 0]
+    elif args.sign == "pos":
+        rows = [r for r in rows if key(r) > 0]
+    rows.sort(key=key, reverse=args.sign == "pos")
+    if args.top:
+        rows = rows[:args.top]
+
+    def pct(v):
+        return "—" if v is None else f"{v:+.1f}%"
+    out = []
+    for r in rows:
+        avg = r["apr_7d"] if r["apr_7d"] is not None else r["apr_24h"]
+        noise = (r["apr_now"] is not None and avg is not None and r["apr_now"] * avg < 0)
+        out.append([r["symbol"], r["product"], pct(r["apr_now"]), pct(r["apr_24h"]),
+                    pct(r["apr_7d"]), f"${r['per_contract']:,.0f}",
+                    f"${r['oi_usd'] / 1e6:,.1f}M",
+                    "—" if r["margin_short"] is None else f"{r['margin_short'] * 100:.0f}%",
+                    ("当前与均值反号=单点噪音" if noise else "")
+                    + ("" if r["session_open"] else " 闭市")])
+    span = meta["span"]
+    days = (span[1] - span[0]).total_seconds() / 86400 if span else 0
+    age = (dt.datetime.now(dt.timezone.utc) - span[1]).total_seconds() / 3600 if span else None
+    label = {"neg": "均值为负（多头收钱）", "pos": "均值为正（空头收钱）", "all": "全部"}[args.sign]
+    print(f"CDE 永续资金费 · {label} · OI ≥ ${args.min_oi:,.0f} · {len(out)} 个")
+    print(f"均值来源：{src}；样本 {days:.1f} 天，最新一条 "
+          + (f"{age:.1f} 小时前" if age is not None else "—")
+          + ("（「7d」实际不足 7 天）" if days < 7 else "") + "\n")
+    if out:
+        _table(out, ["标的", "合约", "当前", "24h均", "7d均", "每张", "OI", "空单隔夜保证金", "提示"])
+    print("\n年化 = 每小时费率 × 8760。正 = 多付空收，负 = 空付多收。只列美国能交易的 CDE；"
+          "Kraken 国际站 PF_ 合约美国账户不可交易，不列。")
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")
+    path = cfg.db_path.parent / f"funding-{stamp}.csv"
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]) if rows else ["symbol"])
+        w.writeheader()
+        w.writerows(rows)
+    print(f"已存 {path}")
 
 
 # ----------------------------------------------------------------- watch
@@ -509,6 +579,12 @@ def main(argv=None) -> None:
     sc.add_argument("--funding-db", help="资金费历史库（默认 ~/git/perp-track/perp.db）")
     sc.add_argument("--paper", action="store_true", help="逐个模拟实跑开+平")
     sc.add_argument("--max-wait", type=float, default=90)
+    fu = sub.add_parser("funding", help="CDE 资金费排行（默认只列均值为负的）")
+    fu.add_argument("--sign", choices=["neg", "pos", "all"], default="neg")
+    fu.add_argument("--min-oi", type=float, default=0, help="OI 下限（美元）")
+    fu.add_argument("--top", type=int)
+    fu.add_argument("--funding-db", help="资金费历史库；不给就先从服务器拉一份")
+    fu.add_argument("--server", default="rhserver", help="perp-track 所在主机；空串 = 不拉")
     w = sub.add_parser("watch", help="巡检与报警")
     w.add_argument("--dry-run", action="store_true", help="只打印，不发通知、不改状态")
     w.add_argument("--test-notify", action="store_true", help="只发一条测试通知")
@@ -542,6 +618,7 @@ def main(argv=None) -> None:
     load_env()
     cfg = load_config()
     {"market": cmd_market, "account": cmd_account, "watch": cmd_watch, "scan": cmd_scan,
+     "funding": cmd_funding,
      "live": lambda c, a: __import__("hedgebot.live", fromlist=["execute"]).execute(c, a),
      "rh-keygen": cmd_rh_keygen, "rh-order": cmd_rh_order, "import-cb-key": cmd_import_cb_key,
      "paper": cmd_paper}[args.cmd](cfg, args)
