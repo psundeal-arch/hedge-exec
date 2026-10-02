@@ -11,6 +11,9 @@ LINK = "LINKUSD"
 XRP = "XRPUSD"
 DOGE = "XDGUSD"
 ZEC = "ZECUSD"
+HBAR = "HBARUSD"
+SUI = "SUIUSD"
+ONDO = "ONDOUSD"
 
 # 费率按小数写（0.004 = 0.40%）。
 # Kraken Pro 最低档：maker 0.25% / taker 0.40%（成交量上去会降）。
