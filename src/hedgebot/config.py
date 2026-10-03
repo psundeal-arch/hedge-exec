@@ -39,6 +39,7 @@ class Config:
     default_usd: float
     db_path: Path
     hold_only: frozenset[str] = frozenset()   # 有意只持现货、不对冲的标的
+    grid_only: frozenset[str] = frozenset()   # CDE 永续由 perp-grid 实盘网格独立交易的标的：不参与对齐、不报警
     min_alert_usd: float = 200.0
     blind_after: int = 3
     resend_hours: tuple[float, ...] = (1, 3, 6, 12, 24)
@@ -68,6 +69,7 @@ def load_config(path: Path | None = None) -> Config:
         default_usd=float(risk["default_usd"]),
         db_path=PROJECT_ROOT / "data" / "paper.db",
         hold_only=frozenset(s.upper() for s in risk.get("hold_only", [])),
+        grid_only=frozenset(s.upper() for s in risk.get("grid_only", [])),
         min_alert_usd=float(watch.get("min_alert_usd", 200)),
         blind_after=int(watch.get("blind_after", 3)),
         resend_hours=tuple(float(x) for x in watch.get("resend_hours", (1, 3, 6, 12, 24))),

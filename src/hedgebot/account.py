@@ -107,6 +107,11 @@ def classify(rows: list[dict], cfg: Config) -> list[dict]:
         px = r["price"]
         mismatch = abs(r["delta"]) / r["spot"] if r["spot"] > 0 else None
         off = mismatch is None or mismatch > cfg.hedge_tolerance
+        if r["asset"] in cfg.grid_only:
+            # perp-grid 实盘网格在 CDE 上独立做这个标的：永续仓位是网格的，不和现货对齐
+            out.append({**r, "flag": "网格实盘（不对齐）", "problem": False, "mismatch": None,
+                        "delta_usd": None, "hint": ""})
+            continue
         held = r["asset"] in cfg.hold_only
         if held and r["perp"] == 0:
             flag = "有意持有"

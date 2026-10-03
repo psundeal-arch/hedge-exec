@@ -93,3 +93,11 @@ def test_cde_funding_table_uses_averages(monkeypatch, tmp_path):
     assert r["apr_24h"] == -12.0 and r["apr_7d"] == -12.0
     assert r["apr_now"] > 0                       # 当前为正、均值为负 → 输出里会标成噪音
     assert r["oi_usd"] == 1000 * 100 * 2.0 and meta["span"] is not None
+
+
+def test_grid_only_perp_is_not_aligned_or_alerted():
+    # perp-grid 实盘网格独立做 SUI：只有永续、没有现货，也不报"没对齐"
+    r = classify([row("SUI", 0.0, -2000.0, px=1.18)], cfg(grid_only=frozenset({"SUI"})))[0]
+    assert r["flag"] == "网格实盘（不对齐）" and not r["problem"]
+    r = classify([row("SUI", 0.0, -2000.0, px=1.18)], cfg())[0]
+    assert r["problem"]
