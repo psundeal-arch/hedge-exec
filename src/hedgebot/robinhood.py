@@ -46,10 +46,13 @@ def keygen() -> tuple[str, str]:
     return base64.b64encode(priv).decode(), base64.b64encode(pub).decode()
 
 
-def holdings(api_key: str, secret_b64: str) -> dict[str, float]:
-    """标的 -> 总数量。key 只需 Read crypto holdings 权限。
+def holdings(api_key: str, secret_b64: str, *, available: bool = False) -> dict[str, float]:
+    """标的 -> 数量。key 只需 Read crypto holdings 权限。
 
-    total_quantity 含挂单冻结的部分 —— 对冲看的是价格风险，冻结的也算。
+    默认取 total_quantity：含挂单冻结和【质押中】的部分 —— 对冲看的是价格风险，
+    这些照样随币价涨跌（2026-10-02 实测质押中的 11 ETH 计入 total）。
+    available=True 取 quantity_available_for_trading：现在就能卖的部分。
+    平仓预检必须用这个 —— 质押中的币卖不了，要先解押、等解绑期。
     """
     out: dict[str, float] = {}
     path = HOLDINGS
@@ -61,7 +64,8 @@ def holdings(api_key: str, secret_b64: str) -> dict[str, float]:
         body = request("GET", BASE + path, "Robinhood 持仓", attempts=1, headers=headers)
         for r in body.get("results") or []:
             code = (r.get("asset_code") or "").upper()
-            qty = float(r.get("total_quantity") or 0)
+            qty = float(r.get("quantity_available_for_trading" if available
+                              else "total_quantity") or 0)
             if code and qty:
                 out[code] = out.get(code, 0.0) + qty
         nxt = body.get("next")

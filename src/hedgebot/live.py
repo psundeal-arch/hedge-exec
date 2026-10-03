@@ -209,7 +209,8 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
                 have = bal.get(sym, 0)
                 if have < qty:
                     blockers.append(f"{args.spot} 可卖 {sym} {have:g} < 要卖 {qty:g}"
-                                    f"（Kraken 质押中的不能直接卖，要先解押）")
+                                    f"（质押中的币不能直接卖：先在 {args.spot} 解押，等解绑期结束；"
+                                    f"期间空单别动，保持对冲）")
 
         # CDE 保证金。只有现金（USD/USDC）计入，【加密现货不算】—— 无论币在 Coinbase
         # 还是 Kraken。所以在 Coinbase 用 USD 买现货，花掉的那笔钱会直接从 CDE 的

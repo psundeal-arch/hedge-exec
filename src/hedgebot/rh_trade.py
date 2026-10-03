@@ -203,5 +203,6 @@ def rh_available(trader: RHTrader) -> dict[str, float]:
     """USD 购买力 + 各币可卖数量（与 kraken_available / coinbase_available 同形状）。"""
     from .robinhood import holdings
     out = {"USD": float(trader.account().get("buying_power") or 0)}
-    out.update(holdings(trader.api_key, trader.secret))
+    # 可卖数量，不是总量：质押中的币卖不了（平仓预检据此拦截）
+    out.update(holdings(trader.api_key, trader.secret, available=True))
     return out
