@@ -289,7 +289,136 @@ def print_plan(plan: dict, args) -> None:
         print(f"  ✗ {b}")
 
 
+def perp_only(cfg: Config, args) -> None:
+    """只动 CDE 合约腿，不碰现货。用于：现货在质押/锁定卖不了时减空单（多出的现货
+    变成有意持有），或者单独补空单。默认只预检；--go 才下单（终端手输确认）。
+
+    成交方式与 Ladder 的空单跟进一致：吃单，限价逐档放宽 30→100→300bp→市价。
+    """
+    from .account import classify, hedge_table
+    from .ladder import MARKET_BPS
+    sym = args.symbol.upper()
+    n = args.contracts
+    if not n:
+        sys.exit("--perp-only 要用 --contracts 指定张数")
+    perps = coinbase.cde_perps()
+    p = perps.get(sym)
+    if not p:
+        sys.exit(f"CDE 没有 {sym} 的永续")
+    cb_auth, _, notes = trade_auths("coinbase", need_trade=args.go)
+    perp = CoinbaseLeg(cb_auth, p["product_id"], is_perp=True)
+    side = "buy" if args.action == "close" else "sell"
+    cs = p["contract_size"]
+    book = perp.book()
+    ref = book.best_ask if side == "buy" else book.best_bid
+    blockers, warns = [], list(notes)
+    if not p["session_open"] or p["trading_disabled"]:
+        blockers.append("CDE 现在闭市或停牌")
+    if ref is None:
+        blockers.append("CDE 订单簿是空的")
+    notional = n * cs * (ref or 0)
+    fee = notional * cfg.fees.cde_taker + n * cfg.fees.cde_per_contract
+    if notional > cfg.live.max_notional_usd:
+        blockers.append(f"名义 ${notional:,.0f} 超过上限 ${cfg.live.max_notional_usd:,.0f}")
+    if args.action == "close":
+        try:
+            held = sum(r["contracts"] for r in coinbase.positions(cb_auth.key_name, cb_auth.key_secret)
+                       if r["product"] == p["product_id"] and r["side"] == "SHORT")
+            if held < n:
+                blockers.append(f"CDE 只有 {held:g} 张空单，要平 {n}")
+        except SourceError as e:
+            blockers.append(f"读不到 CDE 持仓：{e}")
+    try:
+        pv = perp.preview(side, n)
+        if not pv["ok"]:
+            (blockers if args.go else warns).append(f"CDE 预检未通过：{pv['errors']}")
+    except SourceError as e:
+        (blockers if args.go else warns).append(f"CDE 预检请求失败：{e}")
+    # 平/开之后的对冲状态：现货不动，只变空单
+    hedge_line = "  对冲：读不全持仓，没算"
+    try:
+        rows, _, errs = hedge_table(perps)
+        row = next((r for r in rows if r["asset"] == sym), None)
+        if row and not errs:
+            d = n * cs * (1 if args.action == "close" else -1)
+            after = dict(row, perp=row["perp"] + d, delta=row["delta"] + d)
+            a = classify([after], cfg)[0]
+            hedge_line = (f"  对冲：现货 {row['spot']:g} 不动，CDE {row['perp']:g} → {after['perp']:g}，"
+                          f"净 {row['delta']:+g} → {after['delta']:+g}"
+                          f"（≈ ${after['delta'] * (ref or 0):+,.0f}，{a['flag']}）")
+            if a["problem"]:
+                blockers.append(f"做完后 {sym} 会变成「{a['flag']}」并触发报警 —— "
+                                f"多出的现货若是有意持有，先把 {sym} 加进 config.toml 的 hold_only")
+    except SourceError:
+        pass
+    act = "买平空单" if side == "buy" else "卖出开空"
+    print(f"只动合约腿：CDE {act} {n} 张 {p['product_id']}（每张 {cs:g} {sym}）≈ ${notional:,.0f}")
+    print(f"  对手价 {ref:g}，预计手续费 ${fee:.2f}（吃单 + 每张固定费）")
+    print(hedge_line)
+    for w in warns:
+        print(f"  · {w}")
+    for b in blockers:
+        print(f"  ✗ {b}")
+    if blockers:
+        sys.exit("\n有阻断项，不下单。")
+    if not args.go:
+        print("\n以上是预检，没有下单。确认无误后加 --go 真实执行。")
+        return
+    if not sys.stdin.isatty():
+        sys.exit("真实下单必须在终端里手动确认")
+    want = f"{sym} {n} 合约"
+    if input(f"\n真实下单（只动合约）。确认请输入「{want}」：").strip() != want:
+        sys.exit("没确认，不下单")
+
+    db = sqlite3.connect(cfg.db_path.parent / "live.db")
+    db.executescript(SCHEMA)
+    for col in ("mode", "perp_venue"):
+        try:
+            db.execute(f"alter table runs add column {col} text")
+        except sqlite3.OperationalError:
+            pass
+    now = lambda: dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")  # noqa: E731
+    run_id = db.execute("insert into runs(started,symbol,action,spot_venue,contracts,status,mode,"
+                        "perp_venue) values(?,?,?,?,?,?,?,?)",
+                        (now(), sym, f"perp-{args.action}", "none", n, "running", "live",
+                         "cde")).lastrowid
+    db.commit()
+    done, cost, fees = 0, 0.0, 0.0
+    for bps in list(cfg.live.hedge_escalation_bps) + [MARKET_BPS]:
+        want_n = n - done
+        if want_n <= 0:
+            break
+        b = perp.book()
+        r0 = b.best_ask if side == "buy" else b.best_bid
+        limit = None if bps >= MARKET_BPS else (r0 * (1 + bps / 1e4) if side == "buy"
+                                                else r0 * (1 - bps / 1e4))
+        st = perp.take(side, want_n, limit)
+        got = int(round(st.filled))
+        if got:
+            done += got
+            cost += got * cs * (st.avg or 0)
+            fees += st.fee
+            db.execute("insert into fills(run_id,ts,venue,side,qty,price,fee,order_id,kind)"
+                       " values(?,?,?,?,?,?,?,?,?)",
+                       (run_id, now(), "cde", side, got, st.avg, st.fee, None, "taker"))
+            db.commit()
+            print(f"  CDE {act} {got} 张 @ {st.avg:g}（累计 {done}/{n}"
+                  f"{'，' + format(bps, 'g') + 'bp 档' if bps != cfg.live.hedge_escalation_bps[0] else ''}）")
+    status = "done" if done == n else "partial"
+    db.execute("update runs set ended=?, status=?, summary=? where id=?",
+               (now(), status, json.dumps({"contracts": done, "avg": cost / (done * cs) if done else None,
+                                           "fees": fees}), run_id))
+    db.commit()
+    print(f"\n结果：{status}，{done}/{n} 张"
+          + (f" @ {cost / (done * cs):g}，手续费 ${fees:.2f}" if done else ""))
+    print("核对两边：hedge account")
+
+
 def execute(cfg: Config, args) -> None:
+    if getattr(args, "perp_only", False):
+        return perp_only(cfg, args)
+    if not args.spot:
+        sys.exit("要指定 --spot（或者只动合约腿用 --perp-only）")
     paper = args.paper
     plan = preflight(cfg, args, need_trade=args.go)
     print_plan(plan, args)
