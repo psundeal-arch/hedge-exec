@@ -3,6 +3,16 @@
 .env.*
 !.env.example
 data/
+# perp-track 的数据库与运行产物（perp.db 曾被误跟踪，2026-10-01 补上）
+perp.db
+perp.db-journal
+perp.db-wal
+perp.db-shm
+rhearn.db*
+cron.log
+cron.err
+snapshots/
+uv.lock
 
 # Python
 .venv/

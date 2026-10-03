@@ -7,7 +7,9 @@ Kraken 现货多 + Coinbase CDE 永续空，两条腿的对冲工具。
 现货腿可以分散在 Kraken（可质押）和 Robinhood，`account` 会把它们加总后与 CDE 空单对齐。
 Robinhood 只做持仓读取；`paper` 模拟盘的现货腿目前只按 Kraken 的订单簿成交。
 
-和 [perp-track](../perp-track) 的分工：perp-track 只看 Coinbase 那一腿，管保证金、资金费、
+**perp-track 已并入本仓库**（2026-10-02，保留完整历史）：代码在 `src/perptrack/`，配置 `perp-track.toml`，说明见 [docs/perp-track.md](docs/perp-track.md)。两者仍是各自独立的进程。
+
+和 perp-track 的分工：perp-track 只看 Coinbase 那一腿，管保证金、资金费、
 强平距离以及报警；这个项目看的是**两条腿合在一起**的情况，包括是否对齐、开平一轮的成本，
 并在模拟盘里演练执行流程。
 

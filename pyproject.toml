@@ -1,12 +1,14 @@
 [project]
 name = "hedge-bot"
 version = "0.1.0"
-description = "Kraken 现货 + Coinbase CDE 永续空单 的两腿对冲：只读监控 + 模拟盘"
+description = "现货 + Coinbase CDE 永续空单的两腿对冲（hedge）与 CDE 保证金/资金费监控（perp-track）"
 requires-python = ">=3.11"
 dependencies = [
     "requests",
     # CDP 的 API key 是 Ed25519，JWT 要 EdDSA 签名 —— 纯 pyjwt 不带这个后端
     "pyjwt[crypto]",
+    # perp-track 日报：图渲成 PNG 内联进邮件正文（Gmail 不预览 html 附件、会剥掉 <svg>）
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
@@ -14,6 +16,7 @@ dev = ["pytest"]
 
 [project.scripts]
 hedge = "hedgebot.cli:main"
+perp-track = "perptrack.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

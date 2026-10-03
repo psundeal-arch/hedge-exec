@@ -108,7 +108,8 @@ def cmd_account(cfg, args) -> None:
 
 
 # ----------------------------------------------------------------- scan
-PERP_TRACK = Path.home() / "git" / "perp-track"
+# perp-track 已并入本仓库：配置 perp-track.toml、数据库 perp.db 都在仓库根目录
+from .config import PROJECT_ROOT as PERP_TRACK
 
 
 def cmd_scan(cfg, args) -> None:
@@ -119,7 +120,7 @@ def cmd_scan(cfg, args) -> None:
     from .scan import paper_sweep, static_scan
     syms = [s.upper() for s in args.symbols]
     if args.perp_track:
-        with open(PERP_TRACK / "config.toml", "rb") as f:
+        with open(PERP_TRACK / "perp-track.toml", "rb") as f:
             syms += tomllib.load(f)["perp"]["funding_underlyings"]
     if not syms:
         syms = sorted(coinbase.cde_perps())
@@ -202,12 +203,12 @@ def cmd_funding(cfg, args) -> None:
     if db is None and args.server:
         cache = cfg.db_path.parent / "perp-server.db"
         r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                            f"{args.server}:perp-track/perp.db", str(cache)],
+                            f"{args.server}:hedge-bot/perp.db", str(cache)],
                            capture_output=True, text=True)
         if r.returncode == 0:
             db, src = cache, f"{args.server}（刚拉取）"
     if db is None:
-        db, src = PERP_TRACK / "perp.db", "本机 perp-track（可能不是最新）"
+        db, src = PERP_TRACK / "perp.db", "本机 perp.db（可能不是最新）"
     rows, meta = cde_funding_table(db)
 
     def key(r):          # 最长可用窗口的均值；都没有就用当前值
@@ -580,7 +581,7 @@ def main(argv=None) -> None:
     sc = sub.add_parser("scan", help="批量体检：哪些标的适合 Coinbase 现货 + CDE 空单")
     sc.add_argument("symbols", nargs="*")
     sc.add_argument("--perp-track", action="store_true", help="加上 perp-track 的观察名单")
-    sc.add_argument("--funding-db", help="资金费历史库（默认 ~/git/perp-track/perp.db）")
+    sc.add_argument("--funding-db", help="资金费历史库（默认仓库根目录的 perp.db）")
     sc.add_argument("--paper", action="store_true", help="逐个模拟实跑开+平")
     sc.add_argument("--max-wait", type=float, default=90)
     fu = sub.add_parser("funding", help="CDE 资金费排行（默认只列均值为负的）")
