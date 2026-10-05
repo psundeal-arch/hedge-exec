@@ -1,0 +1,21 @@
+[Unit]
+Description=hedge exec worker（日内执行算法：你定量，程序在时间窗内挑时机分批做完）
+After=network-online.target
+Wants=network-online.target
+OnFailure=hedge-bot-failed.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hedge-bot
+# .env = 通知凭据 + 只读 key。交易 key 不在 hedge-bot 目录（deploy.sh 会删掉那里的 .env.trade），
+# worker 从 HEDGE_EXEC_KEYS 读，默认 ~/perp-grid-live/.env.trade（服务器 IP 绑定的 Coinbase View+Trade key）
+EnvironmentFile=%h/hedge-bot/.env
+ExecStart=%h/hedge-bot/.venv/bin/hedge exec worker
+# SIGTERM 后排程器停在安全点；正在做的对冲子单（Ladder）最多几分钟，给够时间收尾。被强杀也没关系：重启后恢复流程会撤旧单、补对冲缺口
+KillSignal=SIGTERM
+TimeoutStopSec=330
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

@@ -8,6 +8,7 @@
 #   perp-track-funding.timer  全场 CDE 资金费采样（每小时 :02）
 #   perp-track-watch.timer    保证金率监控 + Pushover 传呼（每 15 分钟）
 #   hedge-bot-watch.timer     两腿对齐巡检（每 15 分钟 :05/:20/:35/:50）
+#   hedge-exec.service        日内执行 worker（常驻；交易 key 用 ~/perp-grid-live/.env.trade，不在本目录）
 # 保证金传呼是安全网，交易代码改得勤 —— 所以各自独立的进程，互不拖累。
 #
 # 交易 key（.env.trade）【绝不上服务器】；服务器只放只读 key + 通知凭据（.env，600）。
@@ -19,7 +20,7 @@ REMOTE_DIR="${2:-hedge-bot}"
 LOCAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 UNITS="perp-track.service perp-track.timer perp-track-funding.service perp-track-funding.timer \
 perp-track-watch.service perp-track-watch.timer perp-track-pager-failed.service \
-hedge-bot-watch.service hedge-bot-watch.timer hedge-bot-failed.service"
+hedge-bot-watch.service hedge-bot-watch.timer hedge-bot-failed.service hedge-exec.service"
 TIMERS="perp-track.timer perp-track-funding.timer perp-track-watch.timer hedge-bot-watch.timer"
 
 echo "==> 远程 python 版本"
@@ -63,7 +64,8 @@ echo "==> 安装 systemd user 单元"
 ssh "$TARGET" "mkdir -p ~/.config/systemd/user && \
   for u in $UNITS; do cp $REMOTE_DIR/deploy/\$u ~/.config/systemd/user/; done && \
   systemctl --user daemon-reload && \
-  for t in $TIMERS; do systemctl --user enable --now \$t; done"
+  for t in $TIMERS; do systemctl --user enable --now \$t; done && \
+  systemctl --user enable hedge-exec.service && systemctl --user restart hedge-exec.service"
 
 echo "==> 断言定时任务都激活了（漏装 unit 不会报错 —— 代码在、测试过、就是没跑）"
 for t in $TIMERS; do
@@ -74,6 +76,12 @@ for t in $TIMERS; do
     exit 1
   fi
 done
+if ssh "$TARGET" "systemctl --user is-active --quiet hedge-exec.service"; then
+  echo "    hedge-exec.service 运行中"
+else
+  echo "    !! hedge-exec.service 没在跑 —— journalctl --user -u hedge-exec -n 30"
+  exit 1
+fi
 ssh "$TARGET" "systemctl --user list-timers 'perp-track*' 'hedge-bot*' --no-pager | head -6; \
   loginctl show-user \$(whoami) -p Linger"
 

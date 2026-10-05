@@ -9,6 +9,8 @@ Robinhood 只做持仓读取；`paper` 模拟盘的现货腿目前只按 Kraken 
 
 **perp-track 已并入本仓库**（2026-10-02，保留完整历史）：代码在 `src/perptrack/`，配置 `perp-track.toml`，说明见 [docs/perp-track.md](docs/perp-track.md)。两者仍是各自独立的进程。
 
+**hedge exec**（2026-10-05）：日内执行算法 —— 你定量，程序在时间窗内挑时机分批做完对冲加减仓或现货买卖，见 [docs/exec.md](docs/exec.md)。
+
 和 perp-track 的分工：perp-track 只看 Coinbase 那一腿，管保证金、资金费、
 强平距离以及报警；这个项目看的是**两条腿合在一起**的情况，包括是否对齐、开平一轮的成本，
 并在模拟盘里演练执行流程。

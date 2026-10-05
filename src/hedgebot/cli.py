@@ -604,6 +604,8 @@ def main(argv=None) -> None:
     ro.add_argument("--qty", type=float, required=True, help="币的数量")
     ro.add_argument("--limit", type=float, help="限价；不给就是市价单")
     ro.add_argument("--go", action="store_true", help="真实下单（会要求手输确认）")
+    from .exec_cli import add_parser as _exec_parser
+    _exec_parser(sub)
     p = sub.add_parser("paper", help="模拟盘")
     ps = p.add_subparsers(dest="action", required=True)
     o = ps.add_parser("open")
@@ -626,7 +628,8 @@ def main(argv=None) -> None:
      "funding": cmd_funding,
      "live": lambda c, a: __import__("hedgebot.live", fromlist=["execute"]).execute(c, a),
      "rh-keygen": cmd_rh_keygen, "rh-order": cmd_rh_order, "import-cb-key": cmd_import_cb_key,
-     "paper": cmd_paper}[args.cmd](cfg, args)
+     "paper": cmd_paper,
+     "exec": lambda c, a: __import__("hedgebot.exec_cli", fromlist=["run"]).run(c, a)}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":
