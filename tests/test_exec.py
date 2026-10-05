@@ -295,3 +295,119 @@ def test_unreconciled_job_errors_and_pages_without_retry():
     assert job.status == "error"
     assert any("对不上账" in t and p == 1 for t, p in sent)   # 高优先级传呼
     assert "lost" in job.state.log[-1]                        # 报出客户端订单号
+
+
+class Killed(BaseException):
+    """模拟 SIGKILL：不是 Exception，Ladder 的安全出口拦不住，进程就这么没了。"""
+
+
+class KillableSpot(Spot):
+    """挂单每查一次成交 0.5；成交到 kill_at 的那一次查询直接「进程死亡」。"""
+
+    def __init__(self, kill_at, **kw):
+        super().__init__(step=0.5, **kw)
+        self.kill_at = kill_at
+
+    def status(self, oid):
+        st = super().status(oid)
+        if self.kill_at is not None and st.filled >= self.kill_at - 1e-12:
+            raise Killed()
+        return st
+
+
+def test_kill_mid_hedge_child_resumes_without_orphan_or_overtrade(tmp_path):
+    """H2：对冲子单中途被杀 —— 挂着的现货单要被认领撤掉，没记上的成交要补记，
+    半张的零头补齐再对冲，最终两腿各正好 total，不多做。
+
+    原来进度要等 ld.run() 返回才并进任务状态：被杀时状态里一张都没有，
+    挂单号也没存，恢复后从 0 开始再买 2 张，交易所上还挂着一张孤儿单。"""
+    st = Store(tmp_path / "live.db")
+    spot, perp = KillableSpot(kill_at=1.5), Perp()
+    sch, job, _, clk, sent = mk("hedge_open", 2.0, spot=spot, perp=perp, store=st, min_slices=1)
+    st.add(job)
+    clk.t = T0 + 0.9 * 4 * 3600                                 # 进度落后，马上开做
+    with pytest.raises(Killed):
+        sch.run()
+    # 交易所实况：挂单成交了 1.5，空单对冲了 1 张，挂单还挂着
+    assert spot.orders["o0"]["filled"] == 1.5 and spot.orders["o0"]["open"]
+    assert sum(q for _, q in perp.takes) == 1
+
+    # 「重启」：从库里读回任务，新的排程器接着跑
+    spot.kill_at, spot.step = None, 0
+    job2 = st.get(job.id)
+    assert job2.state.done == 1 and job2.state.spot_qty == 1.0, "进度要当场落盘"
+    assert job2.state.child.get("ladder_oid") == "o0", "挂单号要当场落盘"
+    sch2 = Scheduler(job2, spot, perp, contract_size=1.0, ref_fn=lambda: Ref(clk.now(), 100.0, 1.0, None),
+                     store=st, notify=lambda t, m, p=0: sent.append((t, p)), clock=clk.now, sleep=clk.sleep,
+                     say=lambda m: None, poll_s=60.0)
+    sch2.run()
+    assert not spot.orders["o0"]["open"], "孤儿挂单要撤掉"
+    assert job2.status == "done" and job2.state.done == 2
+    bought = sum(o["filled"] for o in spot.orders.values()) + sum(q for _, q, _ in spot.takes)
+    assert bought == pytest.approx(2.0), f"现货不能多买：{bought}"
+    assert sum(q for _, q in perp.takes) == 2
+    assert job2.state.spot_qty == pytest.approx(2.0) and not job2.state.child
+
+
+class _StopLoop(BaseException):
+    pass
+
+
+def _worker_env(tmp_path, monkeypatch, build):
+    import time as _t
+    import types
+    from hedgebot import exec_cli, live, notify
+    st = Store(tmp_path / "live.db")
+    sent = []
+    monkeypatch.setattr(exec_cli, "_store", lambda cfg: st)
+    monkeypatch.setattr(exec_cli, "load_exec_keys", lambda: None)
+    monkeypatch.setattr(live, "build", build)
+    monkeypatch.setattr(notify, "send", lambda t, m, p=0: sent.append((t, p)))
+    monkeypatch.setattr(exec_cli.time, "sleep", lambda s: (_ for _ in ()).throw(_StopLoop()))
+    now = _t.time()
+    for sym in ("ZEC", "LTC"):
+        st.add(Job(kind="spot_buy", symbol=sym, venue="coinbase", total=1.0, start=now - 10,
+                   end=now + 3600, mode="paper"))
+    cfg = types.SimpleNamespace(live=types.SimpleNamespace(hedge_escalation_bps=(30.0, 100.0, 300.0)))
+    return exec_cli, st, sent, cfg
+
+
+def test_worker_config_error_fails_job_and_moves_on(tmp_path, monkeypatch):
+    """H4：build() 抛 SystemExit（服务器没有 RH 交易 key）—— 原来 worker 整个退出、
+    systemd 重启后又选中同一任务，无限循环、不传呼、后面的任务全被堵死。"""
+    built = []
+
+    def build(cfg, sym, venue, **kw):
+        built.append(sym)
+        if sym == "ZEC":
+            raise SystemExit("缺 Robinhood 交易 key")
+        raise _StopLoop()
+    exec_cli, st, sent, cfg = _worker_env(tmp_path, monkeypatch, build)
+    with pytest.raises(_StopLoop):
+        exec_cli.worker(cfg, None)
+    jobs = {j.symbol: j for j in st.list()}
+    assert jobs["ZEC"].status == "error"
+    assert any("启动失败" in t and p == 1 for t, p in sent), sent
+    assert built == ["ZEC", "LTC"], "出错的任务置 error 后，队列要往下走"
+
+
+def test_worker_sigterm_during_build_does_not_start_scheduler(tmp_path, monkeypatch):
+    """H5：SIGTERM 落在 build() 期间 —— 原来新建的排程器 stop=False，照样开跑。"""
+    import os
+    import signal as sig
+    from hedgebot import exec_cli as ec
+    ran = []
+    monkeypatch.setattr(ec.Scheduler, "run", lambda self: ran.append(self.j.id))
+
+    def build(cfg, sym, venue, **kw):
+        os.kill(os.getpid(), sig.SIGTERM)                       # restart 恰好落在这里
+        return {"product_id": "ZEC-PERP", "contract_size": 1.0}, Spot(), None
+    old = sig.getsignal(sig.SIGTERM), sig.getsignal(sig.SIGINT)
+    try:
+        exec_cli, st, sent, cfg = _worker_env(tmp_path, monkeypatch, build)
+        exec_cli.worker(cfg, None)                              # 正常返回 = 停在安全点
+    finally:
+        sig.signal(sig.SIGTERM, old[0])
+        sig.signal(sig.SIGINT, old[1])
+    assert ran == [], "收到 SIGTERM 后不该再开跑新的排程器"
+    assert all(j.status == "queued" for j in st.list()), "任务原样留着，重启后再做"

@@ -135,6 +135,7 @@ class Result:
 class Ladder:
     def __init__(self, spot, perp, *, action: str, contracts: int, contract_size: float,
                  params: Params, on_fill: Callable | None = None,
+                 on_change: Callable | None = None,
                  clock=time.monotonic, sleep=time.sleep, say=print):
         assert action in ("open", "close")
         self.spot, self.perp = spot, perp
@@ -150,7 +151,11 @@ class Ladder:
                          poll_s=max(params.poll_s, getattr(spot, "min_poll_s", 0.0)),
                          reprice_min_s=max(params.reprice_min_s, getattr(spot, "min_reprice_s", 0.0)))
         self.p = params
-        self.on_fill = on_fill or (lambda **kw: None)
+        self._fill_cb = on_fill or (lambda **kw: None)
+        # H2：每次成交、挂单、撤单后回调 on_change(self)。hedge exec 用它把进度和
+        # 当前挂单号【当场】落盘 —— 原来要等 run() 返回才并进任务状态，进程中途被
+        # SIGKILL 的话，挂着的单没人管，已成交的部分也不在状态里（恢复后会多做）。
+        self.on_change = on_change or (lambda ld: None)
         self.clock, self.sleep, self._say = clock, sleep, say
         self.r = Result()
         self.cur: dict | None = None          # 当前挂着的现货单
@@ -181,6 +186,10 @@ class Ladder:
         """一块挂多少：clip_usd 折成币，取整到整张合约，至少一张。"""
         n = max(1, math.floor(self.p.clip_usd / (self.cs * px)))
         return n * self.cs
+
+    def on_fill(self, **kw) -> None:
+        self._fill_cb(**kw)
+        self.on_change(self)
 
     def _place(self) -> str:
         """挂一块。返回 placed / rejected（只挂单被拒，稍后重挂）/ small（剩余量太小）。"""
@@ -220,6 +229,7 @@ class Ladder:
         self.r.spot_orders += 1
         self.cur = {"oid": oid, "px": px, "filled": 0.0, "cost": 0.0, "fee": 0.0,
                     "at": self.clock()}
+        self.on_change(self)
         self.say(f"现货挂{'买' if self.spot_side == 'buy' else '卖'} {rem:g} @ {px:g}"
                  f"（买一 {bid:g} / 卖一 {ask:g}）")
         return "placed"
@@ -266,6 +276,7 @@ class Ladder:
         else:
             raise SourceError(f"现货单 {self.cur['oid']} 撤单后 10 秒仍未到终态")
         self.cur = None
+        self.on_change(self)
 
     def _quote(self, bid: float, ask: float) -> float:
         t = self.spot.tick

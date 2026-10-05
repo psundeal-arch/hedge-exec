@@ -186,8 +186,21 @@ def worker(cfg: Config, args) -> None:
         if job.status == "cancel_requested":
             job.status = "running"                    # 交给排程器在第一轮处理取消
         try:
-            p, spot, perp, *_ = build(cfg, job.symbol, job.venue, need_trade=job.mode == "live",
-                                      paper=job.mode == "paper")
+            try:
+                p, spot, perp, *_ = build(cfg, job.symbol, job.venue, need_trade=job.mode == "live",
+                                          paper=job.mode == "paper")
+            except SystemExit as e:
+                # H4：build()/trade_auths() 缺 key、配置不对时抛 SystemExit（BaseException，
+                # 下面的 except Exception 拦不住）。原来 worker 直接退出 → systemd 60 秒后重启 →
+                # 又选中同一个任务 → 无限循环，任务永远不变 error、不传呼，后面的任务全被堵死。
+                # 这是配置问题，重试不会好：直接置 error 并传呼，让队列往下走。
+                job.status = "error"
+                job.state.log.append(f"启动失败（配置/密钥）：{e}")
+                st.save(job)
+                send(f"hedge exec #{job.id} {job.symbol} 启动失败",
+                     f"{e}。任务已置 error，不会重试；修好配置后重新提交", 1)
+                print(f"[#{job.id}] 启动失败，已置 error：{e}", flush=True)
+                continue
             perp_pid = p["product_id"] if job.hedge else None
             sched = Scheduler(job, spot, perp if job.hedge else None, contract_size=p["contract_size"],
                               ref_fn=lambda: exec_signal.reference(f"{job.symbol}-USD", perp_pid),
@@ -195,6 +208,11 @@ def worker(cfg: Config, args) -> None:
                               say=lambda m: print(f"[#{job.id}] {m}", flush=True),
                               escalation_bps=cfg.live.hedge_escalation_bps)
             stop["sched"] = sched
+            if stop["flag"]:
+                # H5：SIGTERM 落在 build() 期间时 stop["sched"] 还是 None，_term 只设了标志，
+                # 新建的排程器 stop=False 会一直交易到 TimeoutStopSec 被 SIGKILL。
+                # 先登记、再查标志：信号早于登记 → 这里退出（任务原样留着）；晚于登记 → _term 直接停排程器
+                break
             sched.run()
             fails.pop(job.id, None)                   # 「连续」出错：成功一次就清零（审查 H9）
         except Exception as e:                        # noqa: BLE001

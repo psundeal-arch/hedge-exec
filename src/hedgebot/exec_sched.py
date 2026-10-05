@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 from .http import SourceError
-from .ladder import Ladder, Params, Unreconciled, settle
+from .ladder import EPS, Ladder, Params, Unreconciled, settle
 from .trade_api import OrderUnknown, PostOnlyRejected, round_down
 
 EPS = 1e-9
@@ -291,19 +291,31 @@ class Scheduler:
     # ------------------------------------------------------------ 子单
     def _ladder(self, n: int, wait_s: float, cap: float | None = None) -> bool:
         j = self.j
+        s = j.state
+        base = (s.done, s.spot_qty, s.spot_cost, s.spot_fees, s.perp_cost, s.perp_fees)
+
+        def fold(ld) -> None:
+            """子单进度【当场】并进任务状态并落盘（H2）。
+
+            原来要等 ld.run() 返回才并 —— 中途被 SIGKILL，挂着的现货单没人认领，
+            已成交的现货/空单也不在状态里：恢复后 done 偏小会多做，
+            已成交未对冲的现货也不会被补对冲。"""
+            r = ld.r
+            (s.done, s.spot_qty, s.spot_cost, s.spot_fees, s.perp_cost, s.perp_fees) = (
+                base[0] + r.contracts, base[1] + r.spot_qty, base[2] + r.spot_cost,
+                base[3] + r.spot_fees, base[4] + r.perp_cost, base[5] + r.perp_fees)
+            c = ld.cur
+            s.child = ({"ladder_oid": c["oid"], "side": ld.spot_side, "booked": c["filled"],
+                        "cost": c["cost"], "fee": c["fee"]} if c else {})
+            self.save()
+
         ld = Ladder(self.spot, self.perp, action="open" if j.kind == "hedge_open" else "close",
-                    contracts=n, contract_size=self.cs, on_fill=self.on_fill, clock=self.clock, sleep=self.sleep,
-                    say=lambda m: self.say("  " + m),
+                    contracts=n, contract_size=self.cs, on_fill=self.on_fill, on_change=fold,
+                    clock=self.clock, sleep=self.sleep, say=lambda m: self.say("  " + m),
                     params=Params(poll_s=2.0, reprice_min_s=4.0, max_wait_s=wait_s, finish="complete",
                                   clip_usd=j.params.clip_usd, hedge_escalation_bps=self.esc, reprice_cap_bps=cap))
         r = ld.run()
-        s = j.state
-        s.done += r.contracts
-        s.spot_qty += r.spot_qty
-        s.spot_cost += r.spot_cost
-        s.spot_fees += r.spot_fees
-        s.perp_cost += r.perp_cost
-        s.perp_fees += r.perp_fees
+        fold(ld)        # 正常结束时 ld.cur 已是 None；撤单失败/对不上账则留着挂单号供核对
         if r.status == "skipped":
             s.cool_until = self.clock() + COOL_S
         self.save()
@@ -558,19 +570,49 @@ class Scheduler:
                 self._cancel_child()
             except Exception as e:                    # noqa: BLE001
                 self.say(f"撤旧子单失败：{e}")
+        if s.child.get("ladder_oid"):
+            self._settle_ladder_child()
         if self.j.hedge and self.perp:
+            # 现货可能停在半张（子单被打断时）：补齐到整张再对冲，否则零头会留在两腿之间，
+            # 下一份子单又从 0 开始买，现货就多出来了。补齐不超过任务总张数。
+            tgt = max(0, min(math.ceil(s.spot_qty / self.cs - EPS), int(round(self.j.total))))
             ld = Ladder(self.spot, self.perp, action="open" if self.j.kind == "hedge_open" else "close",
-                        contracts=0, contract_size=self.cs, on_fill=self.on_fill, clock=self.clock, sleep=self.sleep,
-                        say=lambda m: self.say("  " + m), params=Params(hedge_escalation_bps=self.esc))
-            ld.r.spot_qty = s.spot_qty
-            ld.r.contracts = int(round(s.done))
+                        contracts=tgt, contract_size=self.cs, on_fill=self.on_fill, clock=self.clock,
+                        sleep=self.sleep, say=lambda m: self.say("  " + m),
+                        params=Params(hedge_escalation_bps=self.esc, finish="complete"))
+            r = ld.r
+            r.spot_qty, r.spot_cost, r.spot_fees = s.spot_qty, s.spot_cost, s.spot_fees
+            r.contracts, r.perp_cost, r.perp_fees = int(round(s.done)), s.perp_cost, s.perp_fees
+            short = ld.target_qty - r.spot_qty
             need = ld._need()
-            if need > 0:
-                self.say(f"有 {need} 张的现货已成交未对冲，补对冲")
-                ld._hedge_all()
-                s.done = ld.r.contracts
-                s.perp_cost += ld.r.perp_cost
-                s.perp_fees += ld.r.perp_fees
+            if need > 0 or short > self.spot.lot / 2:
+                self.say(f"现货已成交未对冲：差 {need} 张空单" + (f"，现货零头补 {short:g}" if short > self.spot.lot / 2 else ""))
+                ld._finish()
+                (s.done, s.spot_qty, s.spot_cost, s.spot_fees, s.perp_cost, s.perp_fees) = (
+                    r.contracts, r.spot_qty, r.spot_cost, r.spot_fees, r.perp_cost, r.perp_fees)
+        self.save()
+
+    def _settle_ladder_child(self) -> None:
+        """对冲子单被打断时挂着的现货单（H2）：对账 → 撤掉 → 把没记上的成交补记。
+
+        补记之后由 resume 后半段统一补对冲。查不清就抛 Unreconciled，
+        run() 会把任务置 error 并传呼 —— 不在未知仓位上继续下单。"""
+        s = self.j.state
+        c = s.child
+        oid, side = c["ladder_oid"], c.get("side", "buy" if self.j.buy else "sell")
+        self.say(f"对冲子单留下的现货挂单 {oid}：对账并撤单")
+        st, oid = settle(self.spot, OrderUnknown(f"进程重启前挂着的现货单 {oid}", leg=self.spot.name,
+                                                 side=side, qty=0.0, oid=oid), sleep=self.sleep, say=self.say)
+        d = st.filled - c.get("booked", 0.0)
+        if d > EPS:
+            cost = st.filled * (st.avg or 0)
+            dc, df = cost - c.get("cost", 0.0), st.fee - c.get("fee", 0.0)
+            s.spot_qty += d
+            s.spot_cost += dc
+            s.spot_fees += df
+            self.on_fill(venue=self.spot.name, side=side, qty=d, price=dc / d, fee=df, order_id=oid, kind="maker")
+            self.say(f"  重启前没记上的成交 +{d:g} @ {dc / d:g}，补记")
+        s.child = {}
         self.save()
 
     def report(self) -> None:
