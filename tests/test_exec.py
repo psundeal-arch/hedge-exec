@@ -411,3 +411,66 @@ def test_worker_sigterm_during_build_does_not_start_scheduler(tmp_path, monkeypa
         sig.signal(sig.SIGINT, old[1])
     assert ran == [], "收到 SIGTERM 后不该再开跑新的排程器"
     assert all(j.status == "queued" for j in st.list()), "任务原样留着，重启后再做"
+
+
+# --- 执行质量 ----------------------------------------------------------------------
+
+def _done_job(kind, *, spot_qty, spot_cost, arrival, done=None, perp_cost=0.0, arrival_basis_bp=None,
+              fees=(0.0, 0.0)):
+    job = Job(kind=kind, symbol="ZEC", venue="coinbase", total=done or spot_qty, start=T0, end=T0 + 3600, id=1)
+    s = job.state
+    s.spot_qty, s.spot_cost, s.arrival, s.done = spot_qty, spot_cost, arrival, done if done is not None else spot_qty
+    s.perp_cost, s.arrival_basis_bp = perp_cost, arrival_basis_bp
+    s.spot_fees, s.perp_fees = fees
+    return job
+
+
+def test_quality_signs_are_costs():
+    """正 = 比基准差。买贵了、卖便宜了、开仓基差变小、平仓基差变大，都是正。"""
+    from hedgebot.exec_quality import measure
+    q = measure(_done_job("spot_buy", spot_qty=1, spot_cost=100.1, arrival=100.0, fees=(0.15, 0)))
+    assert q["arrival_bp"] == pytest.approx(10) and q["cost_bp"] == pytest.approx(10 + 0.15 / 100.1 * 1e4)
+    q = measure(_done_job("spot_sell", spot_qty=1, spot_cost=99.9, arrival=100.0))
+    assert q["arrival_bp"] == pytest.approx(10)
+    # 开仓：开始时基差 +20bp，成交基差 +10bp（卖永续卖得不够贵）→ 成本 10bp
+    q = measure(_done_job("hedge_open", spot_qty=1, spot_cost=100.0, arrival=100.0, done=1,
+                          perp_cost=100.1, arrival_basis_bp=20.0))
+    assert q["exec_basis_bp"] == pytest.approx(10) and q["basis_bp"] == pytest.approx(10)
+    assert q["cost_bp"] == pytest.approx(10), "对冲看基差，不看到达价"
+    # 平仓：开始时 +5bp，成交时 +15bp（买回永续买贵了）→ 成本 10bp
+    q = measure(_done_job("hedge_close", spot_qty=1, spot_cost=100.0, arrival=100.0, done=1,
+                          perp_cost=100.15, arrival_basis_bp=5.0))
+    assert q["basis_bp"] == pytest.approx(10)
+    assert measure(_done_job("spot_buy", spot_qty=0, spot_cost=0, arrival=100.0)) == {}
+
+
+def test_quality_history_rolling_and_report_line(tmp_path):
+    """结束通知要带同标的的滚动值；老任务（summary 没有新字段）按均价补算到达价滑点。"""
+    import json
+    from hedgebot import exec_quality as eq
+    st = Store(tmp_path / "live.db")
+    # 一条老格式的 run：只有 spot_avg / arrival
+    st.db.execute("insert into runs(started,ended,symbol,action,status,mode,summary) values(?,?,?,?,?,?,?)",
+                  ("2026-10-05T10:00:00+00:00", dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                   "ZEC", "exec-spot_buy", "done", "paper",
+                   json.dumps({"spot_qty": 1, "spot_avg": 100.2, "arrival": 100.0})))
+    st.db.commit()
+    rows = eq.history(st.db, symbol="ZEC", mode="paper")
+    assert rows[0]["arrival_bp"] == pytest.approx(20)
+    for bp in (0, 0, 0, 0, 0, 30):                               # 最近几笔变差
+        q = {"spot_qty": 1, "notional": 100.0, "arrival_bp": float(bp), "fee_bp": 0.0, "cost_bp": float(bp)}
+        st.db.execute("insert into runs(started,ended,symbol,action,status,mode,summary) values(?,?,?,?,?,?,?)",
+                      ("x", dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "ZEC",
+                       "exec-spot_buy", "done", "paper", json.dumps(q)))
+    st.db.commit()
+    line = eq.rolling_line(eq.history(st.db, symbol="ZEC", mode="paper"))
+    assert "最近 5 笔 +6.0bp" in line and "变差" in line, line
+
+    sch, job, spot, clk, sent = mk("spot_buy", 1.0, store=st)
+    job.mode = "paper"
+    st.add(job)
+    sch.run()
+    assert job.status == "done"
+    summary = json.loads(st.db.execute("select summary from runs where id=?", (job.run_id,)).fetchone()[0])
+    assert "arrival_bp" in summary and "cost_bp" in summary
+    assert "到达价滑点" not in summary                            # 是数，不是文字

@@ -22,6 +22,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable
 
+from . import exec_quality
 from .http import SourceError
 from .ladder import EPS, Ladder, Params, Unreconciled, settle
 from .trade_api import OrderUnknown, PostOnlyRejected, round_down
@@ -618,15 +619,24 @@ class Scheduler:
     def report(self) -> None:
         j = self.j
         line = f"#{j.id} {j.status}：" + self.summary_line()
-        self.say(line)
-        pr = 1 if j.status == "error" else (0 if j.status == "partial" else -1)
-        self.notify(f"hedge exec #{j.id} {j.symbol} {j.status}", line, pr)
         if self.store and j.run_id:
             s = j.state
             self.store.finish_run(j, {"done": s.done, "total": j.total, "spot_qty": s.spot_qty,
                                       "spot_avg": s.spot_cost / s.spot_qty if s.spot_qty > EPS else None,
-                                      "arrival": s.arrival, "fees": s.spot_fees + s.perp_fees,
-                                      "perp_avg": s.perp_cost / (s.done * self.cs) if j.hedge and s.done else None})
+                                      "arrival": s.arrival, "arrival_basis_bp": s.arrival_basis_bp,
+                                      "fees": s.spot_fees + s.perp_fees,
+                                      "perp_avg": s.perp_cost / (s.done * self.cs) if j.hedge and s.done else None,
+                                      **exec_quality.measure(j, self.cs)})
+            # 同标的的滚动值附在通知里：执行质量的退化是渐进的，单笔看不出来
+            try:
+                roll = exec_quality.rolling_line(exec_quality.history(self.store.db, symbol=j.symbol, mode=j.mode))
+                if roll:
+                    line += f"\n{j.symbol} {roll}"
+            except Exception as e:                    # noqa: BLE001 —— 统计出错不能拦住结束通知
+                self.say(f"执行质量统计出错：{e}")
+        self.say(line)
+        pr = 1 if j.status == "error" else (0 if j.status == "partial" else -1)
+        self.notify(f"hedge exec #{j.id} {j.symbol} {j.status}", line, pr)
 
 
 # ---------------------------------------------------------------- 时间

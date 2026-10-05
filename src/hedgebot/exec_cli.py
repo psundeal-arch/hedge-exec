@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import exec_signal
+from . import exec_quality, exec_signal
 from .config import Config, load_env
 from .exec_sched import Job, JobParams, Scheduler, Store, parse_when
 
@@ -142,6 +142,40 @@ def report(cfg: Config, args) -> None:
         print("  " + line)
 
 
+def quality(cfg: Config, args) -> None:
+    """按标的看执行质量的滚动值。单笔的「比开始时中价贵 x bp」看完就忘，攒成序列才看得出退化。"""
+    rows = exec_quality.history(_store(cfg).db, symbol=args.symbol, mode=args.mode, days=args.days)
+    if not rows:
+        print(f"近 {args.days:g} 天没有{'' if args.mode == 'all' else ('实盘' if args.mode == 'live' else '模拟')}"
+              f"的 exec 成交记录（--mode all 看全部）")
+        return
+    n = args.last
+    print(f"执行质量（成本 bp：正 = 比基准差；按成交额加权；近 {args.days:g} 天，{args.mode}）")
+    print("对冲任务看「合计 = 基差滑点 + 手续费」；纯现货看「合计 = 到达价滑点 + 手续费」，"
+          "到达价里含窗口内的价格漂移，要看多笔均值\n")
+    hdr = f"{'标的':<6}{'类型':<12}{'笔数':>4}{'成交额':>11}{'到达价':>8}{'基差':>8}{'手续费':>8}" \
+          f"{'合计':>8}{f'最近{n}笔':>9}{'变化':>8}"
+    print(hdr)
+    groups: dict[tuple, list] = {}
+    for r in rows:
+        groups.setdefault((r["symbol"], r["kind"]), []).append(r)
+    fmt = lambda v: f"{v:+.1f}" if v is not None else "—"
+    for (sym, kind), g in sorted(groups.items()):
+        k = exec_quality.key_of(g[-1])
+        allv, recent = exec_quality.wavg(g, k), exec_quality.wavg(g[-n:], k)
+        d = recent - allv if (recent is not None and allv is not None and len(g) > n) else None
+        print(f"{sym:<6}{kind:<12}{len(g):>4}{sum(r.get('notional') or 0 for r in g):>11,.0f}"
+              f"{fmt(exec_quality.wavg(g, 'arrival_bp')):>8}{fmt(exec_quality.wavg(g, 'basis_bp')):>8}"
+              f"{fmt(exec_quality.wavg(g, 'fee_bp')):>8}{fmt(allv):>8}{fmt(recent):>9}"
+              f"{(fmt(d) + (' ↑' if d and d > 0 else '')) if d is not None else '—':>8}")
+    if args.detail:
+        print("\n逐笔：")
+        for r in rows:
+            print(f"  {r['ended'][:16]}  #{r['run_id']:<4}{r['symbol']:<6}{r['kind']:<12}{r['status']:<9}"
+                  f"${r.get('notional') or 0:>9,.0f}  到达价 {fmt(r.get('arrival_bp'))}  基差 {fmt(r.get('basis_bp'))}"
+                  f"  手续费 {fmt(r.get('fee_bp'))}  合计 {fmt(r.get('cost_bp'))}")
+
+
 def cancel(cfg: Config, args) -> None:
     st = _store(cfg)
     j = st.get(args.id)
@@ -254,6 +288,12 @@ def add_parser(sub) -> None:
     es.add_parser("status", help="任务列表")
     r = es.add_parser("report", help="任务日志")
     r.add_argument("id", type=int)
+    q = es.add_parser("quality", help="执行质量：按标的看到达价/基差滑点的滚动值")
+    q.add_argument("symbol", nargs="?")
+    q.add_argument("--mode", choices=["live", "paper", "all"], default="live")
+    q.add_argument("--days", type=float, default=90)
+    q.add_argument("--last", type=int, default=exec_quality.ROLL_N, help="「最近 N 笔」的 N")
+    q.add_argument("--detail", action="store_true", help="列出逐笔")
     c = es.add_parser("cancel", help="取消任务（已成交部分保留）")
     c.add_argument("id", type=int)
     es.add_parser("worker", help="后台执行（systemd 用）")
@@ -272,4 +312,4 @@ def _common(p) -> None:
 
 def run(cfg: Config, args) -> None:
     {"open": submit, "close": submit, "buy": submit, "sell": submit, "status": status,
-     "report": report, "cancel": cancel, "worker": worker}[args.exec_cmd](cfg, args)
+     "report": report, "quality": quality, "cancel": cancel, "worker": worker}[args.exec_cmd](cfg, args)
