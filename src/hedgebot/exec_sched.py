@@ -314,7 +314,8 @@ class Scheduler:
                     contracts=n, contract_size=self.cs, on_fill=self.on_fill, on_change=fold,
                     clock=self.clock, sleep=self.sleep, say=lambda m: self.say("  " + m),
                     params=Params(poll_s=2.0, reprice_min_s=4.0, max_wait_s=wait_s, finish="complete",
-                                  clip_usd=j.params.clip_usd, hedge_escalation_bps=self.esc, reprice_cap_bps=cap))
+                                  clip_usd=j.params.clip_usd, hedge_escalation_bps=self.esc, reprice_cap_bps=cap,
+                                  spot_limit=j.params.limit))      # H6：--limit 一路带进子单
         r = ld.run()
         fold(ld)        # 正常结束时 ld.cur 已是 None；撤单失败/对不上账则留着挂单号供核对
         if r.status == "skipped":
@@ -373,6 +374,11 @@ class Scheduler:
                 book = self.spot.book()
                 px = book.best_bid if side == "buy" else book.best_ask
                 if px is None:
+                    break
+                lim = self.j.params.limit
+                if lim and (px > lim if side == "buy" else px < lim):
+                    # H6：decide() 只在一份开始前看一次中价；子单里改价也不能越过 --limit
+                    self.say(f"  价格保护：挂单价 {px:g} 超出上限 {lim:g}，这一份剩余放弃")
                     break
                 if first is None:
                     first = px

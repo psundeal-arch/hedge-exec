@@ -104,6 +104,10 @@ class Params:
     # 追价上限（hedge exec 用；None = 不限，hedge live 的原行为）：挂单价最多比第一次挂的价差这么多 bp。
     # 到上限时一点没成交 → 放弃这一份（status=skipped）；成交了一部分 → 不再改价，挂着等到超时
     reprice_cap_bps: float | None = None
+    # 现货价格硬上限（hedge exec 的 --limit）：建仓方向的现货单（挂单、补齐、只吃单流程）
+    # 买不高于 / 卖不低于这个价。空单对冲【不受限】—— 对冲只升级不放弃，放弃就是裸腿。
+    # 到上限时：已成交的整张照常对冲，凑不满一张的零头退掉（status=trimmed / skipped）
+    spot_limit: float | None = None
     reconcile_tries: int = 6          # 对账回查次数（每次间隔 reconcile_wait_s）
     reconcile_wait_s: float = 5.0
     max_status_failures: int = 5      # 挂单状态连续查不到几次就转入对账
@@ -162,6 +166,7 @@ class Ladder:
         self.hard_failures = 0
         self.post_rejects = 0
         self.first_px: float | None = None
+        self.limited = False                  # 现货碰到 spot_limit 停下了
 
     # ------------------------------------------------------------ 工具
     def say(self, msg: str) -> None:
@@ -284,7 +289,15 @@ class Ladder:
             return round_down(bid + t if ask - bid > 1.5 * t else bid, t)
         return round_up(ask - t if ask - bid > 1.5 * t else ask, t)
 
+    def _beyond_limit(self, px: float) -> bool:
+        lim = self.p.spot_limit
+        if lim is None:
+            return False
+        return px > lim if self.spot_side == "buy" else px < lim
+
     def _beyond_cap(self, px: float) -> bool:
+        if self._beyond_limit(px):
+            return True
         cap = self.p.reprice_cap_bps
         if cap is None or self.first_px is None:
             return False
@@ -390,6 +403,14 @@ class Ladder:
                 continue
             # 只吃单的场所（Robinhood）最后一档发真正的市价单：20% 外的限价可能被拒
             limit = None if (taker_only and bps >= MARKET_BPS) else self._limit(ref, side, bps)
+            if side == self.spot_side and self.p.spot_limit is not None:
+                # H6：价格保护对建仓方向的现货吃单也是硬约束，不能被逐档放宽绕过去
+                lim = self.p.spot_limit
+                if self._beyond_limit(ref):
+                    self.limited = True
+                    self.say(f"  {why}：对手价 {ref:g} 已超出价格保护 {lim:g}，不再吃单")
+                    return
+                limit = (min(limit, lim) if side == "buy" else max(limit, lim)) if limit is not None else lim
             try:
                 st = self.spot.take(side, qty, limit)
             except OrderUnknown as u:
@@ -424,21 +445,28 @@ class Ladder:
 
     def _finish(self) -> None:
         rem = self.target_qty - self.r.spot_qty
-        if rem > self.spot.lot / 2 and self.p.finish == "complete":
+        if rem > self.spot.lot / 2 and self.p.finish == "complete" and not self.limited:
             self._spot_take(self.spot_side, rem, "超时补齐")
-            self._hedge_all()
-            self.r.status = "done"
-        elif rem > self.spot.lot / 2:
-            # trim：凑不满一张的现货零头退掉
-            self._hedge_all()
-            extra = self.r.residual(self.cs)
-            if extra > self.spot.lot / 2:
-                back = "sell" if self.spot_side == "buy" else "buy"
-                self._spot_take(back, extra, "退掉零头")
-            self.r.status = "trimmed"
+            rem = self.target_qty - self.r.spot_qty
+            if rem <= self.spot.lot / 2:
+                self._hedge_all()
+                self.r.status = "done"
+                return
+            self.say(f"  价格保护：补齐不了（还差 {rem:g}），已成交的整张对冲、零头退掉")
+        if rem > self.spot.lot / 2:
+            self._trim()
         else:
             self._hedge_all()
             self.r.status = "done"
+
+    def _trim(self) -> None:
+        """凑不满一张的现货零头退掉。退零头是反方向，不受 spot_limit 约束。"""
+        self._hedge_all()
+        extra = self.r.residual(self.cs)
+        if extra > self.spot.lot / 2:
+            back = "sell" if self.spot_side == "buy" else "buy"
+            self._spot_take(back, extra, "退掉零头")
+        self.r.status = "trimmed" if self.r.spot_qty > EPS or self.r.contracts else "skipped"
 
     # ------------------------------------------------------------ 主循环
     def _loop_taker(self) -> None:
@@ -455,6 +483,8 @@ class Ladder:
             self._spot_take(self.spot_side, step, f"第 {self.r.contracts + 1} 张")
             self.r.spot_orders += 1
             self._hedge()
+            if self.limited:
+                return self._trim()
             if self.r.spot_qty - before < self.spot.lot / 2:
                 stalls += 1
                 if stalls >= 3:

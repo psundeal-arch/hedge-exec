@@ -195,7 +195,9 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
 
     previews = {}
     bal = None
-    if paper and args.action == "close":
+    # 模拟盘仓位只对 hedge live --paper 有意义；hedge exec --dry 不读写 paper.db（H1），
+    # 原来演练平仓永远被「模拟盘里只有 0 张」拦下
+    if paper and args.action == "close" and getattr(args, "paper_position_check", True):
         from .paper import Paper
         pos = Paper(cfg).position(sym)
         held = -pos["contracts"] if pos else 0

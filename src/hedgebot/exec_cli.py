@@ -54,7 +54,8 @@ def submit(cfg: Config, args) -> None:
         if not args.contracts:
             sys.exit("对冲任务要给张数：hedge exec open ZEC 2 ...")
         ns = SimpleNamespace(symbol=sym, spot=args.venue, perp="cde", contracts=args.contracts, usd=None,
-                             action=args.action, max_wait=300, paper=dry, finish="complete")
+                             action=args.action, max_wait=300, paper=dry, finish="complete",
+                             paper_position_check=False)
         plan = preflight(cfg, ns, need_trade=False)
         print_plan(plan, ns)
         blockers = plan["blockers"]

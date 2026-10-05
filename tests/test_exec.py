@@ -474,3 +474,65 @@ def test_quality_history_rolling_and_report_line(tmp_path):
     summary = json.loads(st.db.execute("select summary from runs where id=?", (job.run_id,)).fetchone()[0])
     assert "arrival_bp" in summary and "cost_bp" in summary
     assert "到达价滑点" not in summary                            # 是数，不是文字
+
+
+# --- H6：--limit 是硬约束，子单里也是 ---------------------------------------------
+
+class JumpingSpot(Spot):
+    """挂单成交一半后价格跳到保护价之外，再也不回来。"""
+
+    def __init__(self, **kw):
+        super().__init__(step=0.5, **kw)
+        self.n = 0
+
+    def status(self, oid):
+        st = super().status(oid)
+        if st.filled >= 0.5 and self.bid < 105:
+            self.bid, self.ask = 110.0, 110.02
+            self.step = 0                                       # 价格跑了，旧价位上的挂单再没人成交
+        return st
+
+
+def test_hedge_child_respects_limit_hedges_whole_contracts_and_trims():
+    """H6：对冲子单原来不知道 --limit，超时补齐会按逐档放宽一路追到 +20%。
+    现在：现货超出保护价就不再买；已成交凑不满一张的零头退掉；空单只对冲整张。"""
+    spot, perp = JumpingSpot(), Perp()
+    sch, job, _, clk, sent = mk("hedge_open", 2.0, spot=spot, perp=perp, limit=101.0, min_slices=1)
+    clk.t = T0 + 0.9 * 4 * 3600
+    sch.execute(2, 60.0)
+    buys = [(q, lim) for side, q, lim in spot.takes if side == "buy"]
+    assert all(lim is not None and lim <= 101.0 for _, lim in buys), f"吃单越过了保护价：{buys}"
+    assert not [px for side, _, px in spot.placed if side == "buy" and px > 101.0], "挂单越过了保护价"
+    s = job.state
+    assert s.spot_qty == pytest.approx(s.done), "现货必须正好等于已对冲的整张（零头退掉）"
+    assert sum(q for side, q in perp.takes if side == "sell") == s.done
+
+
+def test_spot_child_respects_limit_when_repricing():
+    """纯现货子单里改价也不能越过 --limit。"""
+    spot = JumpingSpot()
+    sch, job, _, clk, sent = mk("spot_buy", 2.0, spot=spot, limit=101.0, min_slices=1)
+    sch._spot_child(2.0, 120.0)
+    assert not [px for side, _, px in spot.placed if px > 101.0]
+
+
+def test_dry_close_preflight_does_not_read_paper_db(monkeypatch):
+    """H1：exec --dry 不写 paper.db，所以演练平仓的预检不能去 paper.db 里找仓位。"""
+    import types
+    from hedgebot import live
+    from hedgebot.config import load_config
+    cfg = load_config()
+    p = {"contract_size": 1.0, "product_id": "ZEC-PERP", "funding_rate": 1e-5, "session_open": True,
+         "trading_disabled": False, "unit": 1.0, "margin_short_overnight": 0.99}
+    monkeypatch.setattr(live, "build", lambda *a, **k: (p, Spot(bid=1300, ask=1300.2), Perp(1301, 1301.2),
+                                                       None, lambda: {}, 0.0015, []))
+    monkeypatch.setattr(live, "session_risk", lambda *a: None)
+    called = []
+    import hedgebot.paper as paper_mod
+    monkeypatch.setattr(paper_mod, "Paper", lambda cfg: called.append(1) or types.SimpleNamespace(position=lambda s: None))
+    ns = types.SimpleNamespace(symbol="ZEC", spot="coinbase", perp="cde", contracts=1, usd=None, action="close",
+                               max_wait=300, paper=True, finish="complete", paper_position_check=False)
+    plan = live.preflight(cfg, ns, need_trade=False)
+    assert not called and not [b for b in plan["blockers"] if "模拟盘" in b], plan["blockers"]
+    ns.paper_position_check = True                              # hedge live --paper 照旧检查
+    assert [b for b in live.preflight(cfg, ns, need_trade=False)["blockers"] if "模拟盘" in b]
