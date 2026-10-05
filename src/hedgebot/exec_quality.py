@@ -68,9 +68,17 @@ def history(db, *, symbol: str | None = None, mode: str = "live", days: float = 
         if not q.get("spot_qty"):
             continue
         kind = action.removeprefix("exec-")
+        # 老任务（加这个模块之前）：summary 只有均价、到达价、手续费合计，按它们补算
+        if q.get("notional") is None and q.get("spot_avg"):
+            q["notional"] = q["spot_qty"] * q["spot_avg"]
+        if q.get("fee_bp") is None and q.get("fees") is not None and q.get("notional"):
+            q["fee_bp"] = q["fees"] / q["notional"] * 1e4
         if "arrival_bp" not in q and q.get("arrival") and q.get("spot_avg"):
             sign = 1 if kind in ("hedge_open", "spot_buy") else -1
             q["arrival_bp"] = (q["spot_avg"] / q["arrival"] - 1) * 1e4 * sign
+        if q.get("cost_bp") is None and kind.startswith("spot_") \
+                and q.get("arrival_bp") is not None and q.get("fee_bp") is not None:
+            q["cost_bp"] = q["arrival_bp"] + q["fee_bp"]
         q.update(run_id=rid, ended=ended, symbol=sym, kind=kind, status=status, mode=m)
         out.append(q)
     return out

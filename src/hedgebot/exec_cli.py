@@ -171,7 +171,7 @@ def quality(cfg: Config, args) -> None:
     if args.detail:
         print("\n逐笔：")
         for r in rows:
-            print(f"  {r['ended'][:16]}  #{r['run_id']:<4}{r['symbol']:<6}{r['kind']:<12}{r['status']:<9}"
+            print(f"  {r['ended'][:16]}  #{r['run_id']:<4}{r['symbol']:<6}{r['kind']:<12}{r['status']:<10}"
                   f"${r.get('notional') or 0:>9,.0f}  到达价 {fmt(r.get('arrival_bp'))}  基差 {fmt(r.get('basis_bp'))}"
                   f"  手续费 {fmt(r.get('fee_bp'))}  合计 {fmt(r.get('cost_bp'))}")
 
