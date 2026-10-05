@@ -198,3 +198,42 @@ def test_cli_rejects_grid_only(monkeypatch):
     monkeypatch.setattr(exec_cli, "load_exec_keys", lambda: None)
     with pytest.raises(SystemExit, match="grid_only"):
         exec_cli.submit(cfg, args)
+
+
+class RisingSpot(Spot):
+    """挂单永远不成交，每查一次盘口价格涨 5bp（单边上涨）。"""
+    def book(self):
+        self.bid *= 1.0005
+        self.ask = self.bid + 0.02
+        return super().book()
+
+
+def test_ladder_child_gives_up_when_price_runs_away():
+    spot, perp = RisingSpot(step=0), Perp()
+    sch, job, _, clk, sent = mk("hedge_open", 2.0, spot=spot, perp=perp)
+    clk.t = T0 + 0.6 * 4 * 3600
+    sch.execute(1, 240.0)
+    assert job.state.done == 0 and not perp.takes and not spot.takes          # 放弃，不追不吃
+    assert job.state.cool_until > clk.now() and sch.decide(clk.now())[2].startswith("上一份追价")
+    first, last = spot.placed[0][2], spot.placed[-1][2]
+    assert last <= first * 1.0015 + 0.01
+
+
+def test_spot_child_gives_up_when_price_runs_away():
+    spot = RisingSpot(step=0)
+    sch, job, _, clk, sent = mk("spot_buy", 4.0, spot=spot)
+    sch.execute(1.0, 240.0)
+    assert job.state.done == 0 and not spot.takes and job.state.cool_until > clk.now()
+    assert spot.placed[-1][2] <= spot.placed[0][2] * 1.0015 + 0.01
+
+
+def test_notifications_tagged_paper_or_live():
+    sch, job, spot, clk, sent = mk("spot_buy", 1.0, hours=1.0)
+    job.mode = "paper"
+    sch2 = Scheduler(job, spot, None, ref_fn=lambda: Ref(clk.now(), 100.0, 1.0, None),
+                     notify=lambda t, m, p=0: sent.append((t, p)), clock=clk.now, sleep=clk.sleep, say=lambda m: None)
+    sch2.run()
+    assert sent and all(t.startswith("【模拟】") for t, _ in sent)
+    sch3, job3, *_ , sent3 = mk("spot_buy", 1.0, hours=1.0)
+    sch3.run()
+    assert sent3 and all(t.startswith("【实盘】") for t, _ in sent3)

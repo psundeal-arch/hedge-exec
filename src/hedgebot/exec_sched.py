@@ -27,6 +27,7 @@ from .trade_api import PostOnlyRejected, round_down
 
 EPS = 1e-9
 FRONT = 0.85                            # 进度线在窗口的这个比例处到 100%
+COOL_S = 300.0                          # 子单追价放弃后的冷却
 BUY_KINDS = ("hedge_open", "spot_buy")
 
 EXEC_SCHEMA = """
@@ -46,6 +47,7 @@ class JobParams:
     min_slices: int = 4
     child_wait_s: float = 240.0         # 每份挂单最多等多久
     clip_usd: float = 2000.0
+    reprice_cap_bps: float = 15.0       # 每份子单挂单价最多比首次挂价追这么多（很急时不限）
 
 
 @dataclass
@@ -61,6 +63,7 @@ class JobState:
     child_oid: str | None = None        # 纯现货子单（重启时撤掉并补记成交）
     child: dict = field(default_factory=dict)
     progress_sent: int = 0              # 已发过的进度通知（25% 一档）
+    cool_until: float = 0.0             # 子单因追价上限放弃后，冷却到这个时间再下新子单
     paused: str = ""                    # 当前暂停原因（只在变化时通知）
     log: list[str] = field(default_factory=list)
 
@@ -179,7 +182,9 @@ class Scheduler:
                  clock=time.time, sleep=time.sleep, say=print, poll_s: float = 15.0,
                  escalation_bps=(30.0, 100.0, 300.0)):
         self.j, self.spot, self.perp, self.cs = job, spot, perp, contract_size
-        self.ref_fn, self.store, self.notify = ref_fn, store, notify
+        self.ref_fn, self.store = ref_fn, store
+        tag = "【模拟】" if job.mode == "paper" else "【实盘】"   # 通知必须一眼分清演练和真实成交
+        self.notify = lambda t, m, p=0: notify(f"{tag}{t}", f"{tag}{m}", p)
         self.clock, self.sleep, self._say, self.poll_s = clock, sleep, say, poll_s
         self.esc = tuple(escalation_bps)
         self.ref = None
@@ -260,6 +265,8 @@ class Scheduler:
         bt = bad_time(now)
         if bt:
             return "wait", 0.0, bt
+        if now < j.state.cool_until and not urgent:
+            return "wait", 0.0, "上一份追价放弃，冷却中"
         ref = self.ref
         if j.hedge:
             b = self.basis_bp()
@@ -281,13 +288,13 @@ class Scheduler:
         return "wait", 0.0, "进度已到"
 
     # ------------------------------------------------------------ 子单
-    def _ladder(self, n: int, wait_s: float) -> bool:
+    def _ladder(self, n: int, wait_s: float, cap: float | None = None) -> bool:
         j = self.j
         ld = Ladder(self.spot, self.perp, action="open" if j.kind == "hedge_open" else "close",
                     contracts=n, contract_size=self.cs, on_fill=self.on_fill, clock=self.clock, sleep=self.sleep,
                     say=lambda m: self.say("  " + m),
                     params=Params(poll_s=2.0, reprice_min_s=4.0, max_wait_s=wait_s, finish="complete",
-                                  clip_usd=j.params.clip_usd, hedge_escalation_bps=self.esc))
+                                  clip_usd=j.params.clip_usd, hedge_escalation_bps=self.esc, reprice_cap_bps=cap))
         r = ld.run()
         s = j.state
         s.done += r.contracts
@@ -296,8 +303,10 @@ class Scheduler:
         s.spot_fees += r.spot_fees
         s.perp_cost += r.perp_cost
         s.perp_fees += r.perp_fees
+        if r.status == "skipped":
+            s.cool_until = self.clock() + COOL_S
         self.save()
-        if r.status not in ("done", "trimmed"):
+        if r.status not in ("done", "trimmed", "skipped"):
             j.status = "error"
             msg = f"对冲子单 {r.status}：{r.error or '空单跟不上'}；已完成 {s.done:g}/{j.total:g} 张"
             self.say("✗ " + msg)
@@ -331,13 +340,14 @@ class Scheduler:
             self._spot_record(side, st.filled, st.avg, st.fee, None, "taker")
             self.say(f"  现货吃单 {side} {st.filled:g} @ {st.avg:g}（保护价 {limit:g}）")
 
-    def _spot_child(self, q: float, wait_s: float) -> None:
+    def _spot_child(self, q: float, wait_s: float, cap: float | None = None) -> None:
         """纯现货一份：挂单在最优价，被抢到前面就改价；超时撤掉，没成交的留给下一份。"""
         side = "buy" if self.j.buy else "sell"
         if getattr(self.spot, "taker_only", False):
             return self._spot_take(q, 30.0)
         t0 = self.clock()
         s = self.j.state
+        first = None
         while self.clock() - t0 < wait_s and not self.stop:
             left = round_down(q - s.child.get("filled", 0.0), self.spot.lot)
             if left < self.spot.min_qty:
@@ -346,6 +356,12 @@ class Scheduler:
                 book = self.spot.book()
                 px = book.best_bid if side == "buy" else book.best_ask
                 if px is None:
+                    break
+                if first is None:
+                    first = px
+                elif cap is not None and (px > first * (1 + cap / 1e4) if side == "buy" else px < first * (1 - cap / 1e4)):
+                    self.say(f"  价格跑出追价上限 {cap:g}bp，这一份剩余放弃")
+                    s.cool_until = self.clock() + COOL_S
                     break
                 try:
                     oid = self.spot.place_post_only(side, left, px)
@@ -400,13 +416,11 @@ class Scheduler:
         s.child_oid = None
         self.save()
 
-    def execute(self, q: float, wait_s: float, urgent_take: bool = False) -> bool:
+    def execute(self, q: float, wait_s: float, urgent: bool = False) -> bool:
+        cap = None if urgent else self.j.params.reprice_cap_bps
         if self.j.hedge:
-            return self._ladder(int(round(q)), wait_s)
-        if urgent_take:
-            self._spot_take(q, 100.0)
-        else:
-            self._spot_child(q, wait_s)
+            return self._ladder(int(round(q)), wait_s, cap)
+        self._spot_child(q, wait_s, cap)
         return True
 
     # ------------------------------------------------------------ 收尾 / 通知 / 主循环
@@ -480,7 +494,7 @@ class Scheduler:
                 break
             if act == "go":
                 self.say(f"下一份 {q:g}：{why}")
-                if not self.execute(q, j.params.child_wait_s):
+                if not self.execute(q, j.params.child_wait_s, urgent="很急" in why):
                     break
                 self.progress()
                 continue

@@ -53,6 +53,9 @@ class Params:
     max_post_rejects: int = 30        # 连续被「只挂单」拒这么多次才停手（行情在单边狂奔）
     clip_usd: float = 2000.0          # 现货每块最多挂多少美元（至少一张合约的量）
     hedge_escalation_bps: tuple[float, ...] = (30.0, 100.0, 300.0)
+    # 追价上限（hedge exec 用；None = 不限，hedge live 的原行为）：挂单价最多比第一次挂的价差这么多 bp。
+    # 到上限时一点没成交 → 放弃这一份（status=skipped）；成交了一部分 → 不再改价，挂着等到超时
+    reprice_cap_bps: float | None = None
 
 
 @dataclass
@@ -102,6 +105,7 @@ class Ladder:
         self.cur: dict | None = None          # 当前挂着的现货单
         self.hard_failures = 0
         self.post_rejects = 0
+        self.first_px: float | None = None
 
     # ------------------------------------------------------------ 工具
     def say(self, msg: str) -> None:
@@ -138,11 +142,12 @@ class Ladder:
         if rem < self.spot.min_qty:
             self.cur = None
             return "small"
-        t = self.spot.tick
-        if self.spot_side == "buy":
-            px = round_down(bid + t if ask - bid > 1.5 * t else bid, t)
-        else:
-            px = round_up(ask - t if ask - bid > 1.5 * t else ask, t)
+        px = self._quote(bid, ask)
+        if self._beyond_cap(px):
+            self.cur = None
+            return "capped"
+        if self.first_px is None:
+            self.first_px = px
         try:
             oid = self.spot.place_post_only(self.spot_side, rem, px)
         except PostOnlyRejected:
@@ -192,6 +197,19 @@ class Ladder:
         else:
             raise SourceError(f"现货单 {self.cur['oid']} 撤单后 10 秒仍未到终态")
         self.cur = None
+
+    def _quote(self, bid: float, ask: float) -> float:
+        t = self.spot.tick
+        if self.spot_side == "buy":
+            return round_down(bid + t if ask - bid > 1.5 * t else bid, t)
+        return round_up(ask - t if ask - bid > 1.5 * t else ask, t)
+
+    def _beyond_cap(self, px: float) -> bool:
+        cap = self.p.reprice_cap_bps
+        if cap is None or self.first_px is None:
+            return False
+        lim = self.first_px * (1 + cap / 1e4) if self.spot_side == "buy" else self.first_px * (1 - cap / 1e4)
+        return px > lim if self.spot_side == "buy" else px < lim
 
     def _stale(self) -> bool:
         if self.clock() - self.cur["at"] < self.p.reprice_min_s:
@@ -360,6 +378,13 @@ class Ladder:
                 res = self._place()
                 if res == "small":            # 剩余量低于最小下单量
                     break
+                if res == "capped":           # 价格跑出追价上限（只在挂过一次之后发生）
+                    if self.r.spot_qty < EPS:
+                        self.say(f"  价格跑出追价上限 {self.p.reprice_cap_bps:g}bp，一点没成交，放弃这一份")
+                        self.r.status = "skipped"
+                        return
+                    self.say(f"  价格跑出追价上限 {self.p.reprice_cap_bps:g}bp，已成交部分进入收尾")
+                    break
                 if res == "rejected":         # 等一下让簿子稳定，再按新价挂
                     self.sleep(min(self.p.poll_s, 0.5))
                     continue
@@ -375,6 +400,11 @@ class Ladder:
                     self._cancel()
                     break
                 if self._stale():
+                    b = self.spot.book()
+                    if (self.r.spot_qty > EPS and b.best_bid and b.best_ask
+                            and self._beyond_cap(self._quote(b.best_bid, b.best_ask))):
+                        self.sleep(self.p.poll_s)  # 已成交一部分且到追价上限：不改价，挂着等到超时
+                        continue
                     self.say("  被抢到前面，撤单重挂")
                     self._cancel()
                     continue
