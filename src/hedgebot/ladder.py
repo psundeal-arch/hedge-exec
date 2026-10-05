@@ -23,6 +23,10 @@
 
 任何未预料的异常（接口超时、限频、交易所 5xx）走同一个安全出口：撤现货挂单 →
 对冲已成交的整张 → 报告剩余敞口（status = error）。Ctrl-C 也一样（interrupted）。
+
+【结果不明的单子】（下单请求超时、下单后查不到状态，OrderUnknown）：不计失败、
+不重试，先对账（_settle：按订单号或客户端订单号回查 → 还挂着就撤 → 按终态记账）。
+对不上账就 status = unknown：停手、不再下任何单、报出订单号去交易所核对。
 """
 from __future__ import annotations
 
@@ -33,10 +37,54 @@ from typing import Callable
 
 from .book import walk
 from .http import SourceError
-from .trade_api import OrderState, PostOnlyRejected, round_down, round_up
+from .trade_api import OrderState, OrderUnknown, PostOnlyRejected, round_down, round_up
 
 EPS = 1e-9
 MARKET_BPS = 2000.0           # 「市价档」：永续发真正的市价单；现货仍带 20% 保护价
+
+
+class Unreconciled(RuntimeError):
+    """有一笔单子下了、却对不上账（查不到、查询一直出错）。真实敞口未知。
+
+    这时【不再下任何单】：继续对冲或回滚都是在一个不知道的仓位上加码 ——
+    代码审查 C1 的复现里，正是「当失败重试」把 3 张的对冲做成了 9 张裸空。
+    状态标 unknown，报出订单号让人去交易所核对。
+    """
+
+
+def settle(leg, u: OrderUnknown, *, sleep, say, tries: int = 6,
+           wait_s: float = 5.0) -> tuple[OrderState, str]:
+    """把一笔「结果不明」的单子查清楚：找到订单 → 还挂着就撤 → 取终态。
+
+    返回 (终态, 订单号)。查不清就抛 Unreconciled —— 绝不当失败重试。
+    Ladder 与 hedge exec 的纯现货子单共用这一份。
+    """
+    say(f"  ⚠ {u}。停下来对账（不重试）")
+    last = ""
+    for _ in range(tries):
+        try:
+            oid = leg.find(u) if hasattr(leg, "find") else u.oid
+            if oid:
+                st = leg.status(oid)
+                if st.open:
+                    leg.cancel(oid)
+                    for _ in range(10):
+                        st = leg.status(oid)
+                        if not st.open:
+                            break
+                        sleep(1.0)
+                if not st.open:
+                    say(f"  对账：{leg.name} 订单 {oid} 实际成交 {st.filled:g}"
+                        f"{' @ ' + format(st.avg, 'g') if st.avg else ''}（{st.status}）")
+                    return st, oid
+                last = f"订单 {oid} 撤单后仍未到终态"
+            else:
+                last = "订单列表里还没找到"
+        except SourceError as e:
+            last = str(e)
+        sleep(wait_s)
+    raise Unreconciled(f"{u.leg} {u.side} {u.qty:g} 对不上账（{last}）："
+                       f"order_id={u.oid or '?'} client_order_id={u.cid or '?'}")
 
 
 class HedgeStuck(RuntimeError):
@@ -56,11 +104,14 @@ class Params:
     # 追价上限（hedge exec 用；None = 不限，hedge live 的原行为）：挂单价最多比第一次挂的价差这么多 bp。
     # 到上限时一点没成交 → 放弃这一份（status=skipped）；成交了一部分 → 不再改价，挂着等到超时
     reprice_cap_bps: float | None = None
+    reconcile_tries: int = 6          # 对账回查次数（每次间隔 reconcile_wait_s）
+    reconcile_wait_s: float = 5.0
+    max_status_failures: int = 5      # 挂单状态连续查不到几次就转入对账
 
 
 @dataclass
 class Result:
-    status: str = "running"           # done / trimmed / unwound / aborted / error / interrupted
+    status: str = "running"           # done / trimmed / unwound / aborted / error / interrupted / unknown
     spot_qty: float = 0.0             # 现货净成交量（开仓=净买入，平仓=净卖出）
     spot_cost: float = 0.0            # 净成交金额
     spot_fees: float = 0.0
@@ -150,6 +201,13 @@ class Ladder:
             self.first_px = px
         try:
             oid = self.spot.place_post_only(self.spot_side, rem, px)
+        except OrderUnknown as u:
+            # 挂单请求没拿到回复：可能已经挂上、甚至成交。对账：找到就撤掉并按实际成交记账
+            st, oid = self._settle(self.spot, u)
+            self._book_spot_order(oid, st, kind="maker")
+            self.r.spot_orders += 1
+            self.cur = None
+            return "rejected"
         except PostOnlyRejected:
             self.post_rejects += 1
             self.say(f"  挂{'买' if self.spot_side == 'buy' else '卖'} {rem:g} @ {px:g} 会变成吃单被拒"
@@ -169,7 +227,18 @@ class Ladder:
     def _sync(self) -> OrderState:
         """读当前挂单的累计成交，把【增量】记进结果。"""
         c = self.cur
-        st = self.spot.status(c["oid"])
+        try:
+            st = self.spot.status(c["oid"])
+            c["fails"] = 0
+        except SourceError as e:
+            # 查询抖一下不等于出事：挂单还在交易所，下一轮再查。连续查不到才转入对账
+            c["fails"] = c.get("fails", 0) + 1
+            if c["fails"] < self.p.max_status_failures:
+                self.say(f"  查挂单状态出错（第 {c['fails']} 次）：{e}")
+                return OrderState(c["filled"], None, c["fee"], True, "UNKNOWN")
+            st, _ = self._settle(self.spot, OrderUnknown(
+                f"现货挂单 {c['oid']} 连续 {c['fails']} 次查不到状态：{e}", leg=self.spot.name,
+                side=self.spot_side, qty=0.0, oid=c["oid"]))
         d = st.filled - c["filled"]
         if d > EPS:
             cost = st.filled * (st.avg or 0)
@@ -219,6 +288,22 @@ class Ladder:
             return book.best_bid is not None and book.best_bid > self.cur["px"] + self.spot.tick / 2
         return book.best_ask is not None and book.best_ask < self.cur["px"] - self.spot.tick / 2
 
+    # ------------------------------------------------------------ 对账
+    def _settle(self, leg, u: OrderUnknown) -> tuple[OrderState, str]:
+        return settle(leg, u, sleep=self.sleep, say=self.say,
+                      tries=self.p.reconcile_tries, wait_s=self.p.reconcile_wait_s)
+
+    def _book_spot_order(self, oid: str, st: OrderState, *, kind: str) -> None:
+        """一张对账查清的现货单，按它的终态整笔记账。"""
+        if st.filled > EPS:
+            self.r.spot_qty += st.filled
+            self.r.spot_cost += st.filled * (st.avg or 0)
+            self.r.spot_fees += st.fee
+            self._track()
+            self.on_fill(venue=self.spot.name, side=self.spot_side, qty=st.filled,
+                         price=st.avg, fee=st.fee, order_id=oid, kind=kind)
+            self.say(f"  现货成交 +{st.filled:g} @ {st.avg:g}（对账补记）")
+
     # ------------------------------------------------------------ 空单跟进
     def _need(self) -> int:
         return math.floor(self.r.spot_qty / self.cs + EPS) - self.r.contracts
@@ -244,6 +329,8 @@ class Ladder:
             try:
                 limit = None if bps >= MARKET_BPS else self._limit(ref, self.perp_side, bps)
                 st = self.perp.take(self.perp_side, want, limit)
+            except OrderUnknown as u:
+                st, _ = self._settle(self.perp, u)     # 查清实际成交，按实际记账，不重试
             except SourceError as e:
                 return self._hedge_failed(str(e))
             got = int(round(st.filled))
@@ -292,7 +379,10 @@ class Ladder:
                 continue
             # 只吃单的场所（Robinhood）最后一档发真正的市价单：20% 外的限价可能被拒
             limit = None if (taker_only and bps >= MARKET_BPS) else self._limit(ref, side, bps)
-            st = self.spot.take(side, qty, limit)
+            try:
+                st = self.spot.take(side, qty, limit)
+            except OrderUnknown as u:
+                st, _ = self._settle(self.spot, u)
             if st.filled > EPS:
                 sign = 1 if side == self.spot_side else -1
                 self.r.spot_qty += sign * st.filled
@@ -314,6 +404,8 @@ class Ladder:
             back = "sell" if self.spot_side == "buy" else "buy"
             try:
                 self._spot_take(back, extra, "回滚现货")
+            except Unreconciled:
+                raise
             except Exception as e:      # noqa: BLE001
                 self.say(f"✗ 回滚现货失败：{e}")
         left = self.r.residual(self.cs)
@@ -413,18 +505,27 @@ class Ladder:
 
     def run(self) -> Result:
         try:
-            self._loop()
-        except HedgeStuck as e:
-            self.say(f"✗ 空单连续跟不上，停手并回滚现货：{e}")
+            try:
+                self._loop()
+            except HedgeStuck as e:
+                self.say(f"✗ 空单连续跟不上，停手并回滚现货：{e}")
+                self._safe_cancel()
+                self._unwind()
+            except KeyboardInterrupt:
+                self.say("收到 Ctrl-C：撤现货挂单，对冲已成交的整张部分")
+                self._emergency("interrupted")
+            except Unreconciled:
+                raise
+            except Exception as e:          # noqa: BLE001 —— 安全出口：什么异常都先把挂单撤了
+                self.r.error = f"{type(e).__name__}: {e}"
+                self.say(f"✗ 意外错误：{self.r.error}。撤现货挂单，对冲已成交的整张部分")
+                self._emergency("error")
+        except Unreconciled as e:
+            # 真实敞口未知：只撤自己知道的挂单，不再对冲、不回滚 —— 那都是在未知仓位上加码
+            self.r.status = "unknown"
+            self.r.error = str(e)
+            self.say(f"✗ 订单状态对不上账，停手（不再下任何单）：{e}")
             self._safe_cancel()
-            self._unwind()
-        except KeyboardInterrupt:
-            self.say("收到 Ctrl-C：撤现货挂单，对冲已成交的整张部分")
-            self._emergency("interrupted")
-        except Exception as e:          # noqa: BLE001 —— 安全出口：什么异常都先把挂单撤了
-            self.r.error = f"{type(e).__name__}: {e}"
-            self.say(f"✗ 意外错误：{self.r.error}。撤现货挂单，对冲已成交的整张部分")
-            self._emergency("error")
         return self.r
 
     def _emergency(self, status: str) -> None:
@@ -432,6 +533,8 @@ class Ladder:
         try:
             self._hedge_all()
             self.r.status = status
+        except Unreconciled:
+            raise
         except HedgeStuck as e:
             self.say(f"✗ 对冲失败：{e}，回滚现货")
             self._unwind()

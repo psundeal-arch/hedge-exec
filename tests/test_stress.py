@@ -151,13 +151,17 @@ def test_unwind_failure_reports_aborted():
     assert r.residual(CS) == pytest.approx(15)
 
 
-def test_api_error_takes_safe_exit():
-    """查挂单时接口 503：撤单、对冲已成交的整张、状态 error —— 不是直接崩溃。"""
-    spot = Spot(fill_all=False, status_error_at=1)
+def test_one_status_error_is_tolerated():
+    """查挂单时偶发一次 503：挂单还在交易所，下一轮再查 —— 不再整笔停下。
+
+    （C1 之前这里会直接走安全出口；那会按【过期的】成交量去对冲，正是审查指出的
+    「现货腿同一个毛病」。现在一次查询失败只是抖动，连续查不到才转入对账。）
+    """
+    spot = Spot(fill_all=True, status_error_at=1)
     perp = Perp()
     r = go(spot, perp)
-    assert r.status == "error" and "503" in r.error
-    assert all(not o["open"] for o in spot.orders.values())
+    assert r.status == "done" and r.contracts == 3
+    assert r.residual(CS) == pytest.approx(0)
 
 
 def test_post_only_reject_storm_still_completes():

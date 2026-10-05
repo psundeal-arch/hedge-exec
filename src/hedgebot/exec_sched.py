@@ -22,8 +22,9 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable
 
-from .ladder import Ladder, Params
-from .trade_api import PostOnlyRejected, round_down
+from .http import SourceError
+from .ladder import Ladder, Params, Unreconciled, settle
+from .trade_api import OrderUnknown, PostOnlyRejected, round_down
 
 EPS = 1e-9
 FRONT = 0.85                            # 进度线在窗口的这个比例处到 100%
@@ -335,7 +336,10 @@ class Scheduler:
         q = round_down(q, self.spot.lot)
         if q < self.spot.min_qty:
             return
-        st = self.spot.take(side, q, limit)
+        try:
+            st = self.spot.take(side, q, limit)
+        except OrderUnknown as u:                    # 结果不明：对账，不重试
+            st, _ = settle(self.spot, u, sleep=self.sleep, say=self.say)
         if st.filled > EPS:
             self._spot_record(side, st.filled, st.avg, st.fee, None, "taker")
             self.say(f"  现货吃单 {side} {st.filled:g} @ {st.avg:g}（保护价 {limit:g}）")
@@ -368,6 +372,14 @@ class Scheduler:
                 except PostOnlyRejected:
                     self.sleep(1.0)
                     continue
+                except OrderUnknown as u:
+                    # 挂单请求没拿到回复：可能挂上了。对账 → 撤掉 → 按实际成交补记
+                    st, oid = settle(self.spot, u, sleep=self.sleep, say=self.say)
+                    if st.filled > EPS:
+                        s.child["filled"] = s.child.get("filled", 0.0) + st.filled
+                        self._spot_record(side, st.filled, st.avg, st.fee, oid, "maker")
+                    self.save()
+                    continue
                 s.child_oid = oid
                 s.child = {"px": px, "filled": s.child.get("filled", 0.0), "seen": 0.0, "cost": 0.0,
                            "fee": 0.0, "at": self.clock()}
@@ -390,7 +402,19 @@ class Scheduler:
         s = self.j.state
         if not s.child_oid:
             return
-        st = self.spot.status(s.child_oid)
+        try:
+            st = self.spot.status(s.child_oid)
+            s.child["fails"] = 0
+        except SourceError as e:
+            # 偶发查询失败：子单还挂着，下一轮再查；连续查不到才对账（对账会撤单）
+            s.child["fails"] = s.child.get("fails", 0) + 1
+            if s.child["fails"] < 5:
+                self.say(f"  查子单状态出错（第 {s.child['fails']} 次）：{e}")
+                return
+            st, _ = settle(self.spot, OrderUnknown(
+                f"子单 {s.child_oid} 连续查不到状态：{e}", leg=self.spot.name,
+                side="buy" if self.j.buy else "sell", qty=0.0, oid=s.child_oid),
+                sleep=self.sleep, say=self.say)
         d = st.filled - s.child.get("seen", 0.0)
         if d > EPS:
             cost = st.filled * (st.avg or 0)
@@ -406,12 +430,18 @@ class Scheduler:
         s = self.j.state
         if not s.child_oid:
             return
-        self.spot.cancel(s.child_oid)
-        for _ in range(20):
-            st = self.spot.status(s.child_oid)
-            if not st.open:
-                break
-            self.sleep(0.5)
+        try:
+            self.spot.cancel(s.child_oid)
+            for _ in range(20):
+                st = self.spot.status(s.child_oid)
+                if not st.open:
+                    break
+                self.sleep(0.5)
+        except SourceError as e:
+            # 撤单/查询出错：交给对账（会再撤一次并取终态），对不上就整个任务停下
+            settle(self.spot, OrderUnknown(f"撤子单 {s.child_oid} 出错：{e}", leg=self.spot.name,
+                                           side="buy" if self.j.buy else "sell", qty=0.0,
+                                           oid=s.child_oid), sleep=self.sleep, say=self.say)
         self._sync_child()
         s.child_oid = None
         self.save()
@@ -462,6 +492,20 @@ class Scheduler:
         self.save()
 
     def run(self) -> Job:
+        """对不上账（Unreconciled）→ 任务直接 error + 传呼，【不交给 worker 重试】：
+        worker 的重试会走 resume → 再下单，正是 C1 要堵的那条路。"""
+        try:
+            return self._run()
+        except Unreconciled as e:
+            j = self.j
+            j.status = "error"
+            j.state.log.append(f"对不上账，停止：{e}")
+            self.save()
+            self.notify(f"hedge exec #{j.id} {j.symbol} 对不上账，已停止",
+                        f"{e}。不会自动重试；先 hedge account 和交易所页面核对", 1)
+            return j
+
+    def _run(self) -> Job:
         j = self.j
         if j.status == "queued":
             j.status = "running"

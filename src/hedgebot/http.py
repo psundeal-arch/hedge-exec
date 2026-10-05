@@ -12,6 +12,14 @@ class SourceError(RuntimeError):
     """某个数据源取数失败。"""
 
 
+class TransientError(SourceError):
+    """网络错误 / 超时 / 5xx / 限频：【结果不明】。
+
+    和 4xx（交易所明确拒绝，什么都没发生）必须分开：对下单请求来说，
+    超时的那一单可能已经在交易所、甚至已经成交 —— 调用方不能当成「没下」去重试。
+    """
+
+
 def request(method: str, url: str, label: str, *, attempts: int = 3, **kwargs):
     """5xx / 网络错误重试；4xx 直接报错（重试也不会变）。
 
@@ -39,4 +47,4 @@ def request(method: str, url: str, label: str, *, attempts: int = 3, **kwargs):
             last = str(e)
         if i + 1 < attempts:
             time.sleep(1.5 * (i + 1))
-    raise SourceError(f"{label} 请求失败（{attempts} 次）: {last}")
+    raise TransientError(f"{label} 请求失败（{attempts} 次）: {last}")

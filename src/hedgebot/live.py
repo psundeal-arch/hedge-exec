@@ -13,14 +13,15 @@ import math
 import os
 import sqlite3
 import sys
+import time
 
 from . import coinbase
 from .config import PROJECT_ROOT, Config, load_env
 from .http import SourceError
-from .ladder import Ladder, Params
+from .ladder import Ladder, Params, Unreconciled, settle
 from .rh_trade import RHTrader, RobinhoodLeg, rh_available
 from .paper_legs import PaperPerpLeg, PaperSpotLeg, coinbase_trades, kraken_trades
-from .trade_api import (CoinbaseLeg, KrakenLeg, _CoinbaseAuth, _KrakenAuth,
+from .trade_api import (OrderUnknown, CoinbaseLeg, KrakenLeg, _CoinbaseAuth, _KrakenAuth,
                         coinbase_available, kraken_available)
 
 SCHEMA = """
@@ -392,7 +393,18 @@ def perp_only(cfg: Config, args) -> None:
         r0 = b.best_ask if side == "buy" else b.best_bid
         limit = None if bps >= MARKET_BPS else (r0 * (1 + bps / 1e4) if side == "buy"
                                                 else r0 * (1 - bps / 1e4))
-        st = perp.take(side, want_n, limit)
+        try:
+            st = perp.take(side, want_n, limit)
+        except OrderUnknown as u:
+            # 结果不明：对账，不重试（审查 C1）。对不上就停手，报出订单号
+            try:
+                st, _ = settle(perp, u, sleep=time.sleep, say=print)
+            except Unreconciled as e:
+                db.execute("update runs set ended=?, status=?, summary=? where id=?",
+                           (now(), "unknown", json.dumps({"contracts": done, "error": str(e)}), run_id))
+                db.commit()
+                sys.exit(f"\n✗ 订单状态对不上账，已停手（不再下单）：{e}\n"
+                         f"  先 hedge account 和 Coinbase 页面核对，已确认成交 {done}/{n} 张")
         got = int(round(st.filled))
         if got:
             done += got
@@ -511,6 +523,9 @@ def _run(cfg: Config, args, plan: dict, *, mode: str) -> None:
           f"（≈ ${r.max_unhedged * plan['spot_mid']:,.0f}）")
     if r.status == "unwound":
         print("  空单跟不上，已把没对冲的现货退掉（回到零敞口），手续费和价差是这次的成本")
+    if r.status == "unknown":
+        print(f"  ✗ 有一笔单子对不上账，已停手（没有继续对冲或回滚）：{r.error}\n"
+              f"  先 hedge account 和交易所页面核对这笔订单，再决定补单还是平掉")
     if r.status in ("aborted", "error"):
         print(f"  ✗ {r.error or '空单没跟上且现货回滚失败'} —— 先 hedge account 看两边，"
               f"再手动补 CDE 或卖掉现货")

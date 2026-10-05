@@ -196,6 +196,7 @@ def worker(cfg: Config, args) -> None:
                               escalation_bps=cfg.live.hedge_escalation_bps)
             stop["sched"] = sched
             sched.run()
+            fails.pop(job.id, None)                   # 「连续」出错：成功一次就清零（审查 H9）
         except Exception as e:                        # noqa: BLE001
             n = fails[job.id] = fails.get(job.id, 0) + 1
             job.state.log.append(f"worker 出错（第 {n} 次）：{type(e).__name__}: {e}")

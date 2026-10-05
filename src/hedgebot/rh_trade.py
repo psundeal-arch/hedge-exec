@@ -20,7 +20,7 @@ import time
 import urllib.parse
 import uuid
 
-from .http import SourceError, request
+from .http import SourceError, TransientError, request
 from .robinhood import BASE, sign
 
 OPEN_STATES = ("open", "pending", "partially_filled", "queued")
@@ -98,8 +98,10 @@ class RHTrader:
         self._call("POST", f"/api/v2/crypto/trading/orders/{oid}/cancel/", f"Robinhood 撤单 {oid}")
 
     # ---------------------------------------------------------------- 下单
-    def place(self, side: str, symbol: str, qty_str: str, limit_px: str | None = None) -> dict:
-        body = {"client_order_id": str(uuid.uuid4()), "side": side, "symbol": symbol}
+    def place(self, side: str, symbol: str, qty_str: str, limit_px: str | None = None,
+              client_order_id: str | None = None) -> dict:
+        body = {"client_order_id": client_order_id or str(uuid.uuid4()), "side": side,
+                "symbol": symbol}
         if limit_px is None:
             body |= {"type": "market", "market_order_config": {"asset_quantity": qty_str}}
         else:
@@ -165,21 +167,44 @@ class RobinhoodLeg:
                           o.get("state") in OPEN_STATES, o.get("state") or "")
 
     def take(self, side: str, qty: float, limit_px: float | None):
+        from .trade_api import OrderUnknown
         qty_str = fmt_step(qty, self.lot)
-        if limit_px is None:
-            o = self.t.place(side, self.symbol, qty_str)
-        else:
+        px_str = None
+        if limit_px is not None:
             # 保护价朝更容易成交的方向取整：买单向上、卖单向下
             import math
             n = (math.ceil if side == "buy" else math.floor)(limit_px / self.tick - 1e-9 if side == "buy"
                                                             else limit_px / self.tick + 1e-9)
-            o = self.t.place(side, self.symbol, qty_str, fmt_step(n * self.tick, self.tick))
+            px_str = fmt_step(n * self.tick, self.tick)
+        cid, since = str(uuid.uuid4()), time.time()
+        try:
+            o = self.t.place(side, self.symbol, qty_str, px_str, client_order_id=cid)
+        except TransientError as e:
+            raise OrderUnknown(f"robinhood {side} {qty_str}：下单请求结果不明（{e}）",
+                               leg=self.name, side=side, qty=qty, cid=cid, since=since) from e
         oid = o.get("id")
-        o = self.t.wait(oid, timeout_s=10)
-        if o.get("state") in OPEN_STATES:
-            self.t.cancel(oid)
+        try:
             o = self.t.wait(oid, timeout_s=10)
+            if o.get("state") in OPEN_STATES:
+                self.t.cancel(oid)
+                o = self.t.wait(oid, timeout_s=10)
+        except SourceError as e:
+            raise OrderUnknown(f"robinhood 订单 {oid} 已提交，查询/撤单出错（{e}）",
+                               leg=self.name, side=side, qty=qty, oid=oid) from e
         return self._state(o)
+
+    def find(self, u) -> str | None:
+        """对账：有 oid 直接用；否则在下单时刻之后的订单列表里按 client_order_id 找。"""
+        if u.oid:
+            return u.oid
+        start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(u.since - 300))
+        q = urllib.parse.urlencode({"account_number": self.t.account()["account_number"],
+                                    "symbol": self.symbol, "created_at_start": start})
+        res = self.t._call("GET", f"/api/v2/crypto/trading/orders/?{q}", "Robinhood 订单列表")
+        for o in res.get("results") or []:
+            if o.get("client_order_id") == u.cid:
+                return o.get("id")
+        return None
 
     def preview(self, side: str, qty: float) -> dict:
         try:
@@ -192,11 +217,12 @@ class RobinhoodLeg:
     def place_post_only(self, *a, **k):
         raise NotImplementedError("Robinhood 腿只做吃单")
 
-    def status(self, *a, **k):
-        raise NotImplementedError("Robinhood 腿只做吃单")
+    # status / cancel：对账（ladder._settle）要用
+    def status(self, oid: str):
+        return self._state(self.t.order(oid))
 
-    def cancel(self, *a, **k):
-        raise NotImplementedError("Robinhood 腿只做吃单")
+    def cancel(self, oid: str) -> None:
+        self.t.cancel(oid)
 
 
 def rh_available(trader: RHTrader) -> dict[str, float]:

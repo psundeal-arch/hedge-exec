@@ -6,26 +6,28 @@
     status(oid)                    -> OrderState（累计成交量、均价、手续费、是否还挂着）
     cancel(oid)
     take(side, qty, limit_px)      -> OrderState（立即成交，剩余撤销；等到终态才返回）
+    find(u: OrderUnknown)          -> 订单号或 None（按 oid / 客户端订单号回查，对账用）
     preview(side, qty)             -> 不下单的预检（Coinbase preview / Kraken validate）
 
 POST 一律不自动重试：下单请求超时时，单子可能已经下了，重发就是两单。
-Coinbase 靠 client_order_id 去重，Kraken 没有 —— 所以失败直接抛给上层处理。
+
+【结果不明 ≠ 失败】（代码审查 C1，2026-10-05）：下单请求超时、或下单后查状态出错，
+单子可能已经在交易所甚至已经成交。这时抛 OrderUnknown，带上 oid（若已拿到）和
+客户端订单号 —— 上层必须停手对账（ladder._settle），绝不能当成失败按原量重试：
+原来的代码就是这样把 3 张空单的跟进重复了 3 次，交易所上 9 张裸空、程序报「零敞口」。
 """
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
 import math
+import os
 import time
-import urllib.parse
 import uuid
 from dataclasses import dataclass
 
 from . import coinbase, kraken
 from .book import Book
-from .http import SourceError, request
+from .http import SourceError, TransientError, request
 
 
 class PostOnlyRejected(SourceError):
@@ -35,6 +37,21 @@ class PostOnlyRejected(SourceError):
     不会生成订单；Kraken 则是先建单再撤（status=canceled），走 status 那条路。
     2026-10-01 首次实盘加仓时踩到：被当成意外错误，整笔停下。
     """
+
+
+class OrderUnknown(SourceError):
+    """下了单，但不知道它现在怎样了：下单请求超时，或下单后查状态出错。
+
+    oid：交易所订单号（下单成功、之后查询出错时有）；cid：客户端订单号（下单
+    请求本身超时时只有它）；since：下单时刻（回查订单列表的起点）。
+    """
+
+    def __init__(self, msg: str, *, leg: str, side: str, qty: float,
+                 oid: str | None = None, cid: str | None = None, since: float | None = None):
+        super().__init__(msg)
+        self.leg, self.side, self.qty = leg, side, qty
+        self.oid, self.cid = oid, cid
+        self.since = since if since is not None else time.time()
 
 
 @dataclass(frozen=True)
@@ -113,10 +130,16 @@ class CoinbaseLeg:
         raw = px * self.unit
         return fmt(round_up(raw, step) if up else round_down(raw, step), step)
 
-    def _submit(self, side: str, config: dict, label: str) -> str:
-        body = {"client_order_id": str(uuid.uuid4()), "product_id": self.product_id,
+    def _submit(self, side: str, qty: float, config: dict, label: str) -> str:
+        cid, since = str(uuid.uuid4()), time.time()
+        body = {"client_order_id": cid, "product_id": self.product_id,
                 "side": side.upper(), "order_configuration": config}
-        r = self.auth.call("POST", ORDERS, label, body)
+        try:
+            r = self.auth.call("POST", ORDERS, label, body)
+        except TransientError as e:
+            # 请求没拿到回复：单子可能已经下了。只有 client_order_id 能用来回查
+            raise OrderUnknown(f"{label}：下单请求结果不明（{e}）", leg=self.name, side=side,
+                               qty=qty, cid=cid, since=since) from e
         if not r.get("success"):
             err = r.get("error_response") or r
             if "POST_ONLY" in str(err.get("preview_failure_reason") or "") + str(err.get("error") or "") \
@@ -127,7 +150,7 @@ class CoinbaseLeg:
         return (r.get("success_response") or {}).get("order_id") or r["order_id"]
 
     def place_post_only(self, side: str, qty: float, px: float) -> str:
-        return self._submit(side, {"limit_limit_gtc": {
+        return self._submit(side, qty, {"limit_limit_gtc": {
             # 挂单价朝「不会吃单」的方向取整：买单向下、卖单向上
             "base_size": fmt(qty, self.lot), "limit_price": self._price(px, up=side == "sell"),
             "post_only": True}}, f"{self.name} 挂单 {side} {qty:g}@{px:g}")
@@ -159,8 +182,21 @@ class CoinbaseLeg:
             # 保护价朝「更容易成交」的方向取整：买单向上、卖单向下
             config = {"sor_limit_ioc": {"base_size": fmt(qty, self.lot),
                                         "limit_price": self._price(limit_px, up=side == "buy")}}
-        oid = self._submit(side, config, f"{self.name} 吃单 {side} {qty:g}")
-        return _wait_final(self, oid)
+        oid = self._submit(side, qty, config, f"{self.name} 吃单 {side} {qty:g}")
+        return _wait_final(self, oid, side=side, qty=qty)
+
+    def find(self, u: OrderUnknown) -> str | None:
+        """对账：有 oid 直接用；只有 client_order_id 就在下单时刻前后的订单列表里找。"""
+        if u.oid:
+            return u.oid
+        start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(u.since - 300))
+        r = self.auth.call("GET", f"{ORDERS}/historical/batch", f"{self.name} 订单列表",
+                           params={"product_ids": self.product_id, "start_date": start,
+                                   "limit": 250})
+        for o in r.get("orders") or []:
+            if o.get("client_order_id") == u.cid:
+                return o.get("order_id")
+        return None
 
     def preview(self, side: str, qty: float) -> dict:
         body = {"product_id": self.product_id, "side": side.upper(),
@@ -242,7 +278,15 @@ class KrakenLeg:
         return kraken.depth(self.pair)
 
     def _add(self, data: dict, label: str) -> str:
-        r = self.auth.call("/0/private/AddOrder", {"pair": self.pair, **data}, label)
+        # userref：Kraken 的客户端标记（int32），下单请求超时后靠它在挂单/历史单里回查
+        ref, since = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF, time.time()
+        try:
+            r = self.auth.call("/0/private/AddOrder",
+                               {"pair": self.pair, "userref": ref, **data}, label)
+        except TransientError as e:
+            raise OrderUnknown(f"{label}：下单请求结果不明（{e}）", leg=self.name,
+                               side=data.get("type", "?"), qty=float(data.get("volume") or 0),
+                               cid=str(ref), since=since) from e
         return r["txid"][0]
 
     def place_post_only(self, side: str, qty: float, px: float) -> str:
@@ -281,7 +325,20 @@ class KrakenLeg:
             data = {"type": side, "ordertype": "limit", "volume": fmt(qty, self.lot),
                     "price": fmt(px, self.tick), "timeinforce": "IOC"}
         oid = self._add(data, f"kraken 吃单 {side} {qty:g}")
-        return _wait_final(self, oid)
+        return _wait_final(self, oid, side=side, qty=qty)
+
+    def find(self, u: OrderUnknown) -> str | None:
+        if u.oid:
+            return u.oid
+        ref = int(u.cid)
+        o = self.auth.call("/0/private/OpenOrders", {"userref": ref}, "kraken 挂单列表")
+        for txid in (o.get("open") or {}):
+            return txid
+        c = self.auth.call("/0/private/ClosedOrders", {"userref": ref, "start": int(u.since) - 300},
+                           "kraken 历史单")
+        for txid in (c.get("closed") or {}):
+            return txid
+        return None
 
     def preview(self, side: str, qty: float) -> dict:
         try:
@@ -306,13 +363,22 @@ def kraken_available(auth: _KrakenAuth) -> dict[str, float]:
     return out
 
 
-def _wait_final(leg, oid: str, timeout_s: float = 20) -> OrderState:
-    """IOC 单很快就到终态；轮询到不再 open 为止。超时说明交易所卡住了，抛出让上层停手。"""
+def _wait_final(leg, oid: str, timeout_s: float = 20, *, side: str = "?",
+                qty: float = 0.0) -> OrderState:
+    """IOC 单很快就到终态；轮询到不再 open 为止。
+
+    查询出错或超时都抛 OrderUnknown（带 oid）：单子已经下了，结果只是没看到。
+    """
     t0 = time.monotonic()
     while True:
-        st = leg.status(oid)
+        try:
+            st = leg.status(oid)
+        except SourceError as e:
+            raise OrderUnknown(f"{leg.name} 订单 {oid} 已提交，查询状态出错（{e}）",
+                               leg=leg.name, side=side, qty=qty, oid=oid) from e
         if not st.open:
             return st
         if time.monotonic() - t0 > timeout_s:
-            raise SourceError(f"{leg.name} 订单 {oid} {timeout_s:g} 秒还没到终态（{st.status}）")
+            raise OrderUnknown(f"{leg.name} 订单 {oid} {timeout_s:g} 秒还没到终态（{st.status}）",
+                               leg=leg.name, side=side, qty=qty, oid=oid)
         time.sleep(0.5)

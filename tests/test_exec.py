@@ -237,3 +237,61 @@ def test_notifications_tagged_paper_or_live():
     sch3, job3, *_ , sent3 = mk("spot_buy", 1.0, hours=1.0)
     sch3.run()
     assert sent3 and all(t.startswith("【实盘】") for t, _ in sent3)
+
+
+# ---------------------------------------------------------------- 审查 C1：结果不明的单子
+class AmbiguousSpot(Spot):
+    """第一次挂单：交易所其实挂上并【整块成交】了，但请求超时（OrderUnknown，只有客户端订单号）。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.first = True
+        self.exchange_filled = 0.0
+
+    def place_post_only(self, side, qty, px):
+        from hedgebot.trade_api import OrderUnknown
+        oid = super().place_post_only(side, qty, px)
+        self.orders[oid]["cid"] = f"c-{oid}"
+        if self.first:
+            self.first = False
+            o = self.orders[oid]
+            o["filled"], o["open"] = qty, False
+            self.exchange_filled += qty
+            raise OrderUnknown("挂单请求超时", leg=self.name, side=side, qty=qty, cid=f"c-{oid}")
+        return oid
+
+    def status(self, oid):
+        st = super().status(oid)
+        return st
+
+    def find(self, u):
+        return u.oid or next((k for k, o in self.orders.items() if o.get("cid") == u.cid), None)
+
+
+def test_ambiguous_spot_child_is_reconciled_once():
+    sch, job, spot, clk, sent = mk("spot_buy", 4.0, spot=AmbiguousSpot())
+    sch.run()
+    assert job.status == "done"
+    # 超时那一单按实际成交补记了，后面没有把它当「没成交」再买一遍
+    total_bought = sum(o["filled"] for o in spot.orders.values())
+    assert total_bought == pytest.approx(4.0)
+    assert job.state.done == pytest.approx(4.0)
+
+
+class LostSpot(Spot):
+    """挂单请求超时，而且订单列表里永远查不到：对不上账。"""
+
+    def place_post_only(self, side, qty, px):
+        from hedgebot.trade_api import OrderUnknown
+        raise OrderUnknown("挂单请求超时", leg=self.name, side=side, qty=qty, cid="lost")
+
+    def find(self, u):
+        return None
+
+
+def test_unreconciled_job_errors_and_pages_without_retry():
+    sch, job, spot, clk, sent = mk("spot_buy", 4.0, spot=LostSpot())
+    sch.run()
+    assert job.status == "error"
+    assert any("对不上账" in t and p == 1 for t, p in sent)   # 高优先级传呼
+    assert "lost" in job.state.log[-1]                        # 报出客户端订单号
