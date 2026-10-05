@@ -40,7 +40,29 @@ def funding_avgs(db_path: Path | None) -> dict[str, dict[str, float]]:
                 "n24": len(v["24h"])} for p, v in acc.items()}
 
 
-def static_scan(cfg: Config, symbols: list[str], funding_db: Path | None) -> list[dict]:
+def walk_bp(levels, usd: float, mid: float, cs: float = 1.0) -> float | None:
+    """吃掉 usd 美元要付多少：成交均价 vs 中价，bp（正 = 吃亏）。簿子不够吃完返回 None。
+
+    levels 是同一侧从优到劣的 (价格, 数量)，数量 × cs = 币数（CDE 的数量是张）。"""
+    got = cost = 0.0
+    for px, sz in levels:
+        take = min(sz * cs * px, usd - cost)
+        got += take / px
+        cost += take
+        if cost >= usd - 1e-6:
+            return abs(cost / got / mid - 1) * 1e4
+    return None
+
+
+def static_scan(cfg: Config, symbols: list[str], funding_db: Path | None,
+                exit_usd: float | None = None) -> list[dict]:
+    """exit_usd：容量按多大的【出场】算（默认 config [live] exit_usd）。
+
+    进场时「30bp 内深度」只回答能不能进；真正的约束是出场：急着平 $25k 时
+    自己要在 CDE 卖盘上吃掉多少（买回空单 → 吃 asks），以及这笔占两边 24h 成交额多少。
+    现货腿平仓是挂单卖，不吃簿子，但完不成时要吃 bids，一并算给参考。"""
+    from .live import fixed_fee_bp
+    exit_usd = exit_usd or cfg.live.exit_usd
     perps = coinbase.cde_perps()
     avgs = funding_avgs(funding_db)
     f = cfg.fees
@@ -53,8 +75,9 @@ def static_scan(cfg: Config, symbols: list[str], funding_db: Path | None) -> lis
             row["flags"].append("CDE 无永续")
             continue
         try:
-            sb = coinbase.book(f"{s}-USD")
-            pb = coinbase.book(p["product_id"], unit=p["unit"])
+            sb = coinbase.book(f"{s}-USD", limit=250)
+            pb = coinbase.book(p["product_id"], limit=250, unit=p["unit"])
+            spot_vol = coinbase.spot_volume_usd(f"{s}-USD")
         except SourceError as e:
             row["flags"].append(f"取数失败 {e}")
             continue
@@ -92,7 +115,26 @@ def static_scan(cfg: Config, symbols: list[str], funding_db: Path | None) -> lis
             "cost_pct": cost_pct,
             "breakeven_d": cost_pct / (apr / 365) if apr > 0 else None,
             "capital_apy": apr / (1 + margin),
+            "fixed_fee_bp": fixed_fee_bp(cfg, per_contract),
+            "exit_usd": exit_usd,
+            "exit_impact_bp": walk_bp(pb.asks, exit_usd, pb.mid, cs),       # 买回空单
+            "spot_exit_impact_bp": walk_bp(sb.bids, exit_usd, sb.mid),      # 现货挂单卖不完时
+            "perp_adv_share": exit_usd / p["volume_24h_usd"] if p.get("volume_24h_usd") else None,
+            "spot_adv_share": exit_usd / spot_vol if spot_vol else None,
         })
+        lv = cfg.live
+        if row["fixed_fee_bp"] > lv.max_fixed_fee_bp:
+            row["flags"].append(f"固定费 {row['fixed_fee_bp']:.1f}bp/边 超上限，不开")
+        k = f"${exit_usd / 1000:g}K"
+        if row["exit_impact_bp"] is None:
+            row["flags"].append(f"CDE 卖盘吃不完 {k} 出场")
+        elif row["exit_impact_bp"] > lv.max_exit_impact_bp:
+            row["flags"].append(f"{k} 出场冲击 {row['exit_impact_bp']:.0f}bp")
+        for leg, key in (("CDE", "perp_adv_share"), ("现货", "spot_adv_share")):
+            if row[key] is None:
+                row["flags"].append(f"{leg} 无 24h 成交额")
+            elif row[key] > lv.max_adv_share:
+                row["flags"].append(f"{k} 占{leg}日成交 {row[key]:.1%}")
         if abs(row["basis_bp"]) > 100:
             row["flags"].append("基差 >1%（单位不对？）")
         if row["oi_usd"] < 1e6:

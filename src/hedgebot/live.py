@@ -141,6 +141,21 @@ def session_risk(perp: dict, now: dt.datetime, window_s: float) -> str | None:
     return None
 
 
+def fixed_fee_bp(cfg: Config, per_contract_usd: float) -> float:
+    """CDE 每张固定费折成 bp/边。按张收、和名义无关，所以合约越小越贵。"""
+    return cfg.fees.cde_per_contract / per_contract_usd * 1e4 if per_contract_usd > 0 else float("inf")
+
+
+def fixed_fee_blocker(cfg: Config, per_contract_usd: float) -> str | None:
+    """固定费是最小可行规模的硬约束：超上限就不开仓（只用在开仓，平仓永远放行）。"""
+    bp, lim = fixed_fee_bp(cfg, per_contract_usd), cfg.live.max_fixed_fee_bp
+    if bp > lim:
+        return (f"一张 ${per_contract_usd:,.0f}，CDE 固定费 ${cfg.fees.cde_per_contract:g}/张 = {bp:.1f}bp/边"
+                f"（往返 {2 * bp:.1f}bp），超过上限 {lim:g}bp —— 合约太小，固定费吃掉太多"
+                f"（config.toml [live] max_fixed_fee_bp）")
+    return None
+
+
 def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
     """所有能在下单前查的都查一遍。返回计划；有致命问题时 plan['blockers'] 非空。"""
     sym = args.symbol.upper()
@@ -175,6 +190,8 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
                         f"（config.toml [live] max_notional_usd）")
     if qty < spot.min_qty:
         blockers.append(f"现货 {qty:g} 低于最小下单量 {spot.min_qty:g}")
+    if args.action == "open" and (why := fixed_fee_blocker(cfg, cs * pb.mid)):
+        blockers.append(why)
 
     previews = {}
     bal = None
@@ -321,6 +338,8 @@ def perp_only(cfg: Config, args) -> None:
     fee = notional * cfg.fees.cde_taker + n * cfg.fees.cde_per_contract
     if notional > cfg.live.max_notional_usd:
         blockers.append(f"名义 ${notional:,.0f} 超过上限 ${cfg.live.max_notional_usd:,.0f}")
+    if args.action == "open" and ref and (why := fixed_fee_blocker(cfg, cs * ref)):
+        blockers.append(why)
     if args.action == "close":
         try:
             held = sum(r["contracts"] for r in coinbase.positions(cb_auth.key_name, cb_auth.key_secret)

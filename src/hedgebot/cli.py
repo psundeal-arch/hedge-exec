@@ -126,23 +126,32 @@ def cmd_scan(cfg, args) -> None:
         syms = sorted(coinbase.cde_perps())
     syms = list(dict.fromkeys(syms))
     db = Path(args.funding_db).expanduser() if args.funding_db else PERP_TRACK / "perp.db"
-    rows = static_scan(cfg, syms, db)
+    rows = static_scan(cfg, syms, db, exit_usd=getattr(args, "exit_usd", None))
     ok = [r for r in rows if "product" in r]
     ok.sort(key=lambda r: -(r["capital_apy"] or -99))
     print(f"资金费均值来自 {db}（{'有' if any(r.get('n24') for r in ok) else '无'} 24h 样本）；"
           f"一块 = ≤${cfg.live.clip_usd:,.0f}，成本 = 现货挂单×2 + CDE 吃单×2 + 每张固定费 + CDE 半价差×2\n")
     _table([[r["symbol"], f"${r['per_contract']:,.0f}", r["clip_n"],
              f"{r['spot_spread_bp']:.1f}", f"{r['perp_spread_bp']:.1f}",
-             f"${r['perp_depth_usd'] / 1000:,.0f}K", f"{r['basis_bp']:+.1f}",
+             f"${r['perp_depth_usd'] / 1000:,.0f}K",
+             "不够" if r["exit_impact_bp"] is None else f"{r['exit_impact_bp']:.1f}",
+             "—" if r["perp_adv_share"] is None else f"{r['perp_adv_share']:.2%}",
+             "—" if r["spot_adv_share"] is None else f"{r['spot_adv_share']:.2%}",
+             f"{r['fixed_fee_bp']:.1f}", f"{r['basis_bp']:+.1f}",
              f"{r['apr_now']:.1f}%", "—" if r["apr_24h"] is None else f"{r['apr_24h']:.1f}%",
              "—" if r["apr_7d"] is None else f"{r['apr_7d']:.1f}%",
              f"{r['margin'] * 100:.0f}%", f"{r['capital_apy']:.1f}%",
              f"{r['cost_pct']:.2f}%", "—" if r["breakeven_d"] is None else f"{r['breakeven_d']:.1f}",
              f"${r['oi_usd'] / 1e6:,.1f}M", "，".join(r["flags"])] for r in ok],
-           ["标的", "每张", "块张数", "现货价差bp", "CDE价差bp", "CDE深度30bp", "基差bp",
+           ["标的", "每张", "块张数", "现货价差bp", "CDE价差bp", "CDE深度30bp",
+            "出场冲击bp", "CDE参与率", "现货参与率", "固定费bp/边", "基差bp",
             "费率当前", "24h均", "7d均", "空单保证金", "资本年化", "一轮成本", "回本天",
             "OI", "提示"])
     print("\n资本年化 = 24h 均费率 ÷ (1 + 空单隔夜保证金率)：现货全额 + 空单保证金都算占用。")
+    ex = ok[0]["exit_usd"] if ok else cfg.live.exit_usd
+    print(f"容量按【出场 ${ex:,.0f}】算（--exit-usd 改）：出场冲击 = 一口气买回这么多空单，CDE 卖盘成交均价比中价贵多少；"
+          f"参与率 = 出场额 ÷ 24h 成交额（上限 {cfg.live.max_adv_share:.0%}）。"
+          f"固定费 = ${cfg.fees.cde_per_contract:g}/张 折成 bp/边，超过 {cfg.live.max_fixed_fee_bp:g}bp 拒绝开仓。")
     skipped: dict[str, list[str]] = {}
     for r in rows:
         if "product" not in r:
@@ -584,6 +593,7 @@ def main(argv=None) -> None:
     sc.add_argument("--funding-db", help="资金费历史库（默认仓库根目录的 perp.db）")
     sc.add_argument("--paper", action="store_true", help="逐个模拟实跑开+平")
     sc.add_argument("--max-wait", type=float, default=90)
+    sc.add_argument("--exit-usd", type=float, help="容量按多大的出场算（默认 config [live] exit_usd）")
     fu = sub.add_parser("funding", help="CDE 资金费排行（默认只列均值为负的）")
     fu.add_argument("--sign", choices=["neg", "pos", "all"], default="neg")
     fu.add_argument("--min-oi", type=float, default=0, help="OI 下限（美元）")

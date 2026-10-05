@@ -28,6 +28,10 @@ class Live:
     poll_s: float = 2
     clip_usd: float = 2000
     hedge_escalation_bps: tuple[float, ...] = (30, 100, 300)
+    max_fixed_fee_bp: float = 5.0     # CDE 每张固定费折成 bp/边 的上限，超过不开仓（平仓不拦）
+    exit_usd: float = 25000           # 容量按多大的出场算（scan 默认用这个）
+    max_exit_impact_bp: float = 30.0  # 出场时 CDE 吃单冲击上限（VWAP vs 中价）
+    max_adv_share: float = 0.01       # 出场额占 24h 成交额的上限（参与率）
 
 
 @dataclass(frozen=True)

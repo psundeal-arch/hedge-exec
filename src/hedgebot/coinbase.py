@@ -81,6 +81,7 @@ def cde_perps() -> dict[str, dict]:
             "close_time": (p.get("fcm_trading_session_details") or {}).get("close_time"),
             "maintenance": (p.get("fcm_trading_session_details") or {}).get("maintenance"),
             "trading_disabled": bool(p.get("trading_disabled")),
+            "volume_24h_usd": _f(p.get("approximate_quote_24h_volume")),
             "margin_short_overnight": _f((d.get("overnight_margin_rate") or {})
                                          .get("short_margin_rate")),
             "margin_short_intraday": _f((d.get("intraday_margin_rate") or {})
@@ -89,6 +90,12 @@ def cde_perps() -> dict[str, dict]:
     if not out:
         raise SourceError("合约列表里没有 CDE 永续（接口结构变了？）")
     return out
+
+
+def spot_volume_usd(product_id: str) -> float | None:
+    """现货 24h 成交额（美元）。算参与率用。"""
+    body = request("GET", f"https://{HOST}{PRODUCTS}/{product_id}", f"Coinbase {product_id}")
+    return _f(body.get("approximate_quote_24h_volume"))
 
 
 def book(product_id: str, limit: int = 100, unit: float = 1.0) -> Book:
