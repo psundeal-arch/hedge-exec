@@ -107,7 +107,8 @@ ssh "$TARGET" "for f in .env.trade .env.local; do \
     mv $REMOTE_DIR/\$f $REMOTE_DIR/.deploy-backup/$TS/ && echo \"    !! 移走了 $REMOTE_DIR/\$f（备份在 .deploy-backup/$TS）\"; fi; done"
 
 echo "==> 凭据（服务器 ~/vault，不推送，只校验）"
-if ! ssh "$TARGET" bash -s -- "$VAULT_NEEDS" <<'REMOTE'
+# ssh 会把参数拼成一行重新分词 —— 不加内层引号，远程 $1 只拿到第一项（第一次部署就这样漏检了三个文件）
+if ! ssh "$TARGET" bash -s -- "'$VAULT_NEEDS'" <<'REMOTE'
 set -uo pipefail
 bad=0
 [ "$(stat -c %a ~/vault 2>/dev/null)" = 700 ] || { echo "    !! ~/vault 不存在或权限不是 700"; bad=1; }
