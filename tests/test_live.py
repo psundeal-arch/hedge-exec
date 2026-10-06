@@ -28,3 +28,23 @@ def test_walk_bp_measures_own_exit_not_entry_depth():
     assert walk_bp(asks, 50_000, mid) is None, "簿子吃不完要说出来，不能当成没冲击"
     # 卖盘（bids）方向：成交价低于中价，冲击仍是正数
     assert walk_bp(((99.9, 1000.0),), 10_000, mid) == pytest.approx(10, rel=1e-6)
+
+
+def test_load_env_reads_vault_whitelist_after_dotenv(tmp_path, monkeypatch):
+    """凭据集中到 ~/vault：.env 优先，vault 只按白名单补缺 —— 交易密钥文件不读。"""
+    import os
+    from hedgebot import config
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "notify.env").write_text("PUSHOVER_TOKEN=from_vault\nX_ONLY_VAULT=v\n")
+    (vault / "coinbase-trade-server.env").write_text("COINBASE_TRADE_KEY_NAME=must_not_load\n")
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("PUSHOVER_TOKEN=from_dotenv\n")
+    monkeypatch.setattr(config, "VAULT_DIR", vault)
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    for k in ("PUSHOVER_TOKEN", "X_ONLY_VAULT", "COINBASE_TRADE_KEY_NAME"):
+        monkeypatch.delenv(k, raising=False)
+    config.load_env()
+    assert os.environ["PUSHOVER_TOKEN"] == "from_dotenv", ".env 在的时候它说了算"
+    assert os.environ["X_ONLY_VAULT"] == "v", "vault 补缺口"
+    assert "COINBASE_TRADE_KEY_NAME" not in os.environ, "交易密钥不在白名单里"

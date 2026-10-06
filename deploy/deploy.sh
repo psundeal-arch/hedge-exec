@@ -11,13 +11,14 @@
 #   hedge-exec.service        日内执行 worker（常驻；交易 key 用 ~/perp-grid-live/.env.trade，不在本目录）
 # 保证金传呼是安全网，交易代码改得勤 —— 所以各自独立的进程，互不拖累。
 #
-# 交易 key（.env.trade）【绝不上服务器】；服务器只放只读 key + 通知凭据（.env，600）。
+# 交易 key（.env.trade）【绝不上服务器的 hedge-bot 目录】。
+# 凭据正本在服务器 ~/vault（2026-10-06 集中，目录 700、文件 600）：部署【不推任何凭据】，
+# 只校验各单元要挂的 vault 文件在、权限对、键齐 —— 少了就停，不让单元带着缺变量起来。
 # perp.db（资金费历史、快照、告警幂等）远程已有就【绝不覆盖】。
 #
 # 三道关（审查 H3/H11）：
 #   1. 只部署已提交的 HEAD（git archive），本机测试不过什么都不动
-#   2. 服务器上的 config.toml / perp-track.toml / .env 被手改过 → 停下给 diff
-#      （.env 只列键名）；确认覆盖用 FORCE_CONFIG=1
+#   2. 服务器上的 config.toml / perp-track.toml 被手改过 → 停下给 diff；确认覆盖用 FORCE_CONFIG=1
 #   3. 服务器上 pip + 测试 + 冒烟在 set -euo pipefail 里跑，不过就不重启 hedge-exec
 # 被覆盖/删除的文件备份在服务器 .deploy-backup/<时间>（留 10 份）；当前版本记在 .deployed/COMMIT
 set -euo pipefail
@@ -30,7 +31,12 @@ perp-track-watch.service perp-track-watch.timer perp-track-pager-failed.service 
 hedge-bot-watch.service hedge-bot-watch.timer hedge-bot-failed.service hedge-exec.service"
 TIMERS="perp-track.timer perp-track-funding.timer perp-track-watch.timer hedge-bot-watch.timer"
 
-CONFIGS="config.toml perp-track.toml .env"
+CONFIGS="config.toml perp-track.toml"
+# 各单元挂的 vault 文件及其必须有的键（与 deploy/*.service 的 EnvironmentFile 对应）
+VAULT_NEEDS="coinbase-view.env:COINBASE_API_KEY_NAME,COINBASE_API_PRIVATE_KEY \
+kraken-view.env:KRAKEN_API_KEY,KRAKEN_API_SECRET \
+robinhood-view.env:RH_API_KEY,RH_PRIVATE_KEY \
+notify.env:PUSHOVER_TOKEN,PUSHOVER_USER,DISCORD_WEBHOOK_URL"
 TS="$(date -u +%Y%m%d-%H%M%S)"
 
 # --- 关卡一：部署的必须正好是某个提交，且本机测试通过（H3）---------------------
@@ -54,7 +60,6 @@ ssh "$TARGET" 'python3 -c "import sys; assert sys.version_info>=(3,11); print(sy
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 git archive HEAD | tar -x -C "$STAGE"
-cp "$LOCAL_DIR/.env" "$STAGE/.env"
 
 # --- 关卡二：服务器上的配置有没有被手改（H11）------------------------------------
 # 原来 rsync --delete 静默覆盖 config.toml / perp-track.toml / .env —— 服务器上的手改
@@ -76,13 +81,7 @@ for f in $CONFIGS; do
     echo "    !! $f 服务器版本和本机不同（还没有部署记录，分不清是谁改的）"
   fi
   drift=1
-  if [ "$f" = ".env" ]; then
-    # 密钥不打到终端：只列出值不同 / 只在一边的键名
-    echo "       服务器→本机 有差异的键：$(diff <(sort "$STAGE/.remote/$f") <(sort "$STAGE/$f") \
-      | grep -E '^[<>] [A-Z_]+=' | sed -E 's/^[<>] ([A-Z_]+)=.*/\1/' | sort -u | tr '\n' ' ')"
-  else
-    diff -u --label "服务器 $f" --label "本机 $f" "$STAGE/.remote/$f" "$STAGE/$f" | sed 's/^/       /' || true
-  fi
+  diff -u --label "服务器 $f" --label "本机 $f" "$STAGE/.remote/$f" "$STAGE/$f" | sed 's/^/       /' || true
 done
 if [ "$drift" = 1 ] && [ "${FORCE_CONFIG:-0}" != 1 ]; then
   echo "    先把服务器上的改动合进本机仓库（或确认可以丢掉），再部署；"
@@ -107,12 +106,29 @@ ssh "$TARGET" "for f in .env.trade .env.local; do \
   if [ -f $REMOTE_DIR/\$f ]; then mkdir -p $REMOTE_DIR/.deploy-backup/$TS && \
     mv $REMOTE_DIR/\$f $REMOTE_DIR/.deploy-backup/$TS/ && echo \"    !! 移走了 $REMOTE_DIR/\$f（备份在 .deploy-backup/$TS）\"; fi; done"
 
-echo "==> 传 .env（600，旧的备份到 .deploy-backup/$TS）"
-ssh "$TARGET" "mkdir -p $REMOTE_DIR/.deploy-backup/$TS $REMOTE_DIR/data && \
-  if [ -f $REMOTE_DIR/.env ]; then cp -p $REMOTE_DIR/.env $REMOTE_DIR/.deploy-backup/$TS/.env; fi"
-scp -q "$LOCAL_DIR/.env" "$TARGET:$REMOTE_DIR/.env"
-ssh "$TARGET" "chmod 600 $REMOTE_DIR/.env; chmod -R go-rwx $REMOTE_DIR/.deploy-backup"
-echo "    键：$(grep -oE '^[A-Z_]+=' "$LOCAL_DIR/.env" | tr -d '=' | tr '\n' ' ')"
+echo "==> 凭据（服务器 ~/vault，不推送，只校验）"
+if ! ssh "$TARGET" bash -s -- "$VAULT_NEEDS" <<'REMOTE'
+set -uo pipefail
+bad=0
+[ "$(stat -c %a ~/vault 2>/dev/null)" = 700 ] || { echo "    !! ~/vault 不存在或权限不是 700"; bad=1; }
+for item in $1; do
+  f="${item%%:*}"; keys="${item#*:}"
+  p=~/vault/$f
+  if [ ! -f "$p" ]; then echo "    !! 缺 vault/$f"; bad=1; continue; fi
+  [ "$(stat -c %a "$p")" = 600 ] || { echo "    !! vault/$f 权限不是 600"; bad=1; }
+  for k in ${keys//,/ }; do
+    grep -qE "^$k=.+" "$p" || { echo "    !! vault/$f 缺 $k"; bad=1; }
+  done
+  echo "    vault/$f ✓"
+done
+# 交易 key 不该出现在 vault 以外的 hedge-bot 目录；RH 交易 key 按决定只留本机（2026-10-06）
+[ -f ~/vault/robinhood-trade.env ] && { echo "    !! vault 里又出现了 robinhood-trade.env（决定是 RH 交易 key 只留本机）"; bad=1; }
+exit $bad
+REMOTE
+then
+  echo "!! vault 校验没过 —— 什么都还没动（单元没装、服务没重启）"
+  exit 1
+fi
 
 echo "==> 数据库"
 if ssh "$TARGET" "test -f $REMOTE_DIR/perp.db"; then
@@ -145,7 +161,7 @@ echo "==> 冒烟（与 systemd 同样的环境；出现 Traceback 或缺关键�
 if ! ssh "$TARGET" bash -s -- "$REMOTE_DIR" <<'REMOTE'
 set -uo pipefail
 cd "$1"
-set -a; . ./.env; set +a
+set -a; for f in coinbase-view kraken-view robinhood-view notify misc; do . ~/vault/$f.env; done; set +a
 out="$(.venv/bin/perp-track status 2>&1)"
 echo "$out" | grep -E '账户保证金率|能扛住' || true
 if echo "$out" | grep -q Traceback || ! echo "$out" | grep -q '账户保证金率'; then

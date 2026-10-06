@@ -82,9 +82,26 @@ def load_config(path: Path | None = None) -> Config:
     )
 
 
+VAULT_DIR = Path(os.environ.get("HEDGE_VAULT_DIR") or Path.home() / "vault")
+# 只读 + 通知。显式白名单，不是 glob —— glob 会把将来放进 vault 的交易密钥也吃进来。
+# 交易 key 从不经这里：本机 hedge live / rh-order 读 .env.trade，服务器 exec 读 HEDGE_EXEC_KEYS
+VAULT_FILES = ("coinbase-view.env", "kraken-view.env", "robinhood-view.env", "notify.env", "misc.env")
+
+
 def load_env(path: Path | None = None) -> None:
-    """极简 .env：KEY=VALUE，不覆盖已有环境变量。"""
-    path = path or PROJECT_ROOT / ".env"
+    """极简 .env：KEY=VALUE，不覆盖已有环境变量。
+
+    不给 path 时：先项目 .env，再 ~/vault 里白名单的几个文件补缺口（2026-10-06 凭据集中到
+    服务器 ~/vault，与 perptrack.config.load_env 同一口径）。.env 在就是它说了算，
+    删掉之后 vault 接管；本机没有 vault，照旧只用 .env。"""
+    if path is not None:
+        return _inject(path)
+    _inject(PROJECT_ROOT / ".env")
+    for name in VAULT_FILES:
+        _inject(VAULT_DIR / name)
+
+
+def _inject(path: Path) -> None:
     if not path.exists():
         return
     for line in path.read_text().splitlines():
