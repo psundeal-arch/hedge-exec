@@ -133,6 +133,17 @@ def test_bad_time_waits():
     assert not bad_time(T0)
 
 
+def test_bad_time_follows_new_york_dst():
+    """CDE 周五闭市是美东 17:00–18:00。11-01 结束夏令时后对应 UTC 22:00–23:00。"""
+    u = lambda *a: dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp()
+    # 夏令时（10-09 周五）：闭市 21:00–22:00 UTC
+    assert bad_time(u(2026, 10, 9, 21, 30)) and not bad_time(u(2026, 10, 9, 22, 30))
+    # 冬令时（11-06 周五）：闭市 22:00–23:00 UTC；原来写死的 UTC 窗口在这里正好错开
+    assert bad_time(u(2026, 11, 6, 22, 30)), "冬令时的真正闭市时段要拦"
+    assert bad_time(u(2026, 11, 6, 21, 45)), "闭市前 30 分钟（美东 16:45）"
+    assert not bad_time(u(2026, 11, 6, 20, 45)), "美东 15:45 不是闭市前后"
+
+
 def test_hedge_open_uses_ladder_and_basis_gate():
     perp = Perp(bid=100.0, ask=100.02)                          # 永续不比现货贵：基差 ≈ 0
     ref = Ref(T0, 100.0, 1.0, 10.0)                             # 近 24h 中位数 +10bp

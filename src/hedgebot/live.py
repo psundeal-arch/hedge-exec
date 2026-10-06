@@ -125,7 +125,8 @@ def session_risk(perp: dict, now: dt.datetime, window_s: float) -> str | None:
     """CDE 在 window_s 秒内会闭市或进维护窗口 → 返回原因。
 
     一轮挂单最长要 max_wait_s；跑到一半闭市，空单就跟不上了，现货成了裸腿。
-    close_time 是交易日的切换点（每天 21:00 UTC），不一定真的停盘 ——
+    close_time 是交易日的切换点（每天美东 17:00：夏令时 21:00 UTC、冬令时 22:00 UTC），
+    不一定真的停盘 —— 时间取自接口，不受夏令时影响；
     这里按会停处理，宁可多等一刻钟。
     """
     def parse(t):

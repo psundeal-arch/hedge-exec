@@ -21,6 +21,7 @@ import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from . import exec_quality
 from .http import SourceError
@@ -167,12 +168,18 @@ class Store:
 
 
 # ---------------------------------------------------------------- 时段
+ET = ZoneInfo("America/New_York")
+
+
 def bad_time(now: float) -> str | None:
     t = time.gmtime(now)
     m = t.tm_min
     if m >= 58 or m < 2:
         return "整点资金费结算前后"
-    if t.tm_wday == 4 and ((t.tm_hour == 20 and m >= 30) or t.tm_hour == 21):
+    # CDE 周五闭市是【美东】17:00–18:00。原来写死成 UTC 20:30–22:00，只在夏令时对；
+    # 11-01 之后（EST）真正的闭市是 UTC 22:00–23:00，写死的窗口会提前一小时、漏掉闭市。
+    et = dt.datetime.fromtimestamp(now, ET)
+    if et.weekday() == 4 and ((et.hour == 16 and et.minute >= 30) or et.hour == 17):
         return "周五 CDE 闭市前后"
     return None
 
