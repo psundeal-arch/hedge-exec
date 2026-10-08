@@ -46,7 +46,7 @@ default_usd = 5000
 hold_only = ["PAXG", "DOGE", "BTC", "ETH"]
 # CDE 永续由 perp-grid 实盘网格独立交易（2026-10-03 起 SUI；10-04 加 XRP，服务器上已先改）：仓位不和现货对齐、watch 不报警。
 # 这些标的不要再用 hedge live 开对冲空单 —— 会和网格的仓位混在一起。
-grid_only = ["SUI", "XRP"]
+grid_only = ["SUI", "XRP", "ADA"]
 
 [live]
 # 单次开/平仓的名义金额上限（美元）。超过就拒绝，防止手滑多打一个 0
