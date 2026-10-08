@@ -10,7 +10,19 @@ from .http import SourceError
 STABLES = ("USD", "USDC", "USDT", "USDG", "EUR")
 
 
-def hedge_table(perps: dict[str, dict]) -> tuple[list[dict], list[str], list[str]]:
+MISSING = "未配置凭据："      # errors 里以它开头的是「永久缺凭据」（配置问题），不是临时取数失败（M4）
+VENUES = ("kraken", "robinhood", "coinbase")
+
+
+def _missing(errors: list[str], notes: list[str], venue: str, expected, msg: str) -> None:
+    """该场所缺凭据：应有的（expected）记成配置错误，本来就不该有的只记一条提示。"""
+    if expected is None or venue in expected:
+        errors.append(MISSING + msg)
+    else:
+        notes.append(f"{venue} 未配置（本机不需要）")
+
+
+def hedge_table(perps: dict[str, dict], expected=None) -> tuple[list[dict], list[str], list[str]]:
     """返回 (逐标的对齐行, 提示, 错误)。
 
     错误 = 某个来源没读到（取数失败或缺凭据）。【有错误时对齐结果不可信】：
@@ -36,7 +48,7 @@ def hedge_table(perps: dict[str, dict]) -> tuple[list[dict], list[str], list[str
         except SourceError as e:
             errors.append(f"Kraken 余额取数失败：{e}")
     else:
-        errors.append("没有 KRAKEN_API_KEY / KRAKEN_API_SECRET（只需 Query Funds 权限）")
+        _missing(errors, notes, "kraken", expected, "没有 KRAKEN_API_KEY / KRAKEN_API_SECRET（只需 Query Funds 权限）")
 
     rk, rs = os.environ.get("RH_API_KEY"), os.environ.get("RH_PRIVATE_KEY")
     if rk and rs:
@@ -46,7 +58,7 @@ def hedge_table(perps: dict[str, dict]) -> tuple[list[dict], list[str], list[str
         except SourceError as e:
             errors.append(f"Robinhood 持仓取数失败：{e}")
     else:
-        errors.append("没有 RH_API_KEY / RH_PRIVATE_KEY（hedge rh-keygen 生成）")
+        _missing(errors, notes, "robinhood", expected, "没有 RH_API_KEY / RH_PRIVATE_KEY（hedge rh-keygen 生成）")
 
     cn, cs = os.environ.get("COINBASE_API_KEY_NAME"), os.environ.get("COINBASE_API_PRIVATE_KEY")
     if cn and cs:
@@ -70,7 +82,7 @@ def hedge_table(perps: dict[str, dict]) -> tuple[list[dict], list[str], list[str
         except SourceError as e:
             errors.append(f"Coinbase 持仓取数失败：{e}")
     else:
-        errors.append("没有 COINBASE_API_KEY_NAME / COINBASE_API_PRIVATE_KEY（只需 View 权限）")
+        _missing(errors, notes, "coinbase", expected, "没有 COINBASE_API_KEY_NAME / COINBASE_API_PRIVATE_KEY（只需 View 权限）")
 
     rows = []
     for asset in sorted(set(spot) | set(shorts)):

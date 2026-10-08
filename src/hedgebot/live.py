@@ -432,6 +432,11 @@ def perp_only(cfg: Config, args) -> None:
             break
         b = perp.book()
         r0 = b.best_ask if side == "buy" else b.best_bid
+        if r0 is None and bps < MARKET_BPS:
+            # M5：簿子这一侧空了（闭市/薄盘），原来 None * … 直接 TypeError，已成交的部分没记账。
+            # 限价档没有参考价就跳过，交给下一档；最后一档是市价，不需要参考价
+            print(f"  CDE {'卖' if side == 'buy' else '买'}盘是空的，跳过 {bps:g}bp 档")
+            continue
         limit = None if bps >= MARKET_BPS else (r0 * (1 + bps / 1e4) if side == "buy"
                                                 else r0 * (1 - bps / 1e4))
         try:

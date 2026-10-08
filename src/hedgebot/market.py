@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from . import coinbase, kraken
 from .book import Book, walk
 from .config import Config, Fees
+from .http import SourceError
 
 
 @dataclass(frozen=True)
@@ -44,8 +45,18 @@ def fetch_quotes(cfg: Config, symbols: list[str]) -> tuple[list[Quote], list[str
     """返回 (行情, 跳过的原因)。单个标的失败不影响其它。"""
     perps = coinbase.cde_perps()
     pairs = [cfg.symbols[s] for s in symbols if s in cfg.symbols]
-    info = kraken.pair_info(pairs) if pairs else {}
     quotes, skipped = [], []
+    try:
+        info = kraken.pair_info(pairs) if pairs else {}
+    except SourceError as e:
+        # M7：一个写错的交易对会让批量查询整体报错，原来在逐个标的的 try 之前抛出、整张表全灭。
+        # 退回逐个查，坏的那个单独跳过
+        info = {}
+        for pr in pairs:
+            try:
+                info |= kraken.pair_info([pr])
+            except SourceError as e1:
+                skipped.append(f"{pr}: Kraken 交易对查不到（{e1}）")
     for s in symbols:
         pair = cfg.symbols.get(s)
         if not pair:

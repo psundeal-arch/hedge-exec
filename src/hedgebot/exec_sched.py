@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 
 from . import exec_quality
 from .http import SourceError
-from .ladder import EPS, Ladder, Params, Unreconciled, settle
+from .ladder import EPS, HedgeStuck, Ladder, Params, Unreconciled, settle
 from .trade_api import OrderUnknown, PostOnlyRejected, round_down
 
 EPS = 1e-9
@@ -325,6 +325,13 @@ class Scheduler:
                                   spot_limit=j.params.limit))      # H6：--limit 一路带进子单
         r = ld.run()
         fold(ld)        # 正常结束时 ld.cur 已是 None；撤单失败/对不上账则留着挂单号供核对
+        left = r.residual(self.cs)
+        if r.status in ("done", "trimmed") and abs(left) > self.spot.lot / 2:
+            # M2：补齐/退零头的吃单只成交一部分时，Ladder 照样报 done/trimmed —— 零头没对冲。
+            # 原来只在 Ladder 日志里打一行，任务报告看不到
+            self.say(f"⚠ 子单结束但现货零头 {left:+g} 未对冲")
+            self.notify(f"hedge exec #{j.id} {j.symbol} 有未对冲零头",
+                        f"子单 {r.status}，但现货比空单多 {left:+g}（凑不满一张）。hedge account 核对后手动处理", 1)
         if r.status == "skipped":
             s.cool_until = self.clock() + COOL_S
         self.save()
@@ -497,9 +504,11 @@ class Scheduler:
             if s.arrival:
                 bp = (avg / s.arrival - 1) * 1e4 * (1 if j.buy else -1)
                 out += f"（比开始时中价 {s.arrival:g} {'贵' if bp > 0 else '便宜'} {abs(bp):.1f}bp）"
-        if j.hedge and s.done and s.spot_qty > EPS:
+        if j.hedge and s.done and avg:
             pavg = s.perp_cost / (s.done * self.cs)
             out += f"，永续均价 {pavg:g}，成交基差 {(pavg / avg - 1) * 1e4:+.1f}bp"
+        if j.hedge and abs(s.spot_qty - s.done * self.cs) > self.spot.lot / 2:
+            out += f"，⚠ 现货零头 {s.spot_qty - s.done * self.cs:+g} 未对冲"
         out += f"，手续费 ${s.spot_fees + s.perp_fees:.2f}"
         return out
 
@@ -601,9 +610,19 @@ class Scheduler:
             need = ld._need()
             if need > 0 or short > self.spot.lot / 2:
                 self.say(f"现货已成交未对冲：差 {need} 张空单" + (f"，现货零头补 {short:g}" if short > self.spot.lot / 2 else ""))
-                ld._finish()
-                (s.done, s.spot_qty, s.spot_cost, s.spot_fees, s.perp_cost, s.perp_fees) = (
-                    r.contracts, r.spot_qty, r.spot_cost, r.spot_fees, r.perp_cost, r.perp_fees)
+                try:
+                    ld._finish()
+                except HedgeStuck as e:
+                    # M1：原来一路抛出 run()，任务留在 running、也跳过 save() —— worker 重试又走
+                    # resume 再撞一次。空单跟不上就是裸腿，停手 + 高优先级传呼，交给人
+                    self.j.status = "error"
+                    self.say(f"✗ 恢复时空单跟不上：{e}")
+                    self.notify(f"hedge exec #{self.j.id} {self.j.symbol} 恢复时空单跟不上",
+                                f"{e}。现货有未对冲部分，已停止 —— 先 hedge account 核对两腿", 1)
+                finally:
+                    (s.done, s.spot_qty, s.spot_cost, s.spot_fees, s.perp_cost, s.perp_fees) = (
+                        r.contracts, r.spot_qty, r.spot_cost, r.spot_fees, r.perp_cost, r.perp_fees)
+                    self.save()
         self.save()
 
     def _settle_ladder_child(self) -> None:

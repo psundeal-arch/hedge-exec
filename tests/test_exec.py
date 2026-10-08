@@ -547,3 +547,49 @@ def test_dry_close_preflight_does_not_read_paper_db(monkeypatch):
     assert not called and not [b for b in plan["blockers"] if "模拟盘" in b], plan["blockers"]
     ns.paper_position_check = True                              # hedge live --paper 照旧检查
     assert [b for b in live.preflight(cfg, ns, need_trade=False)["blockers"] if "模拟盘" in b]
+
+
+# --- M1 / M2 ------------------------------------------------------------------------
+
+class StuckPerp(Perp):
+    """CDE 下单一直报错：空单跟不上。"""
+
+    def take(self, side, qty, limit_px):
+        from hedgebot.http import SourceError
+        raise SourceError("CDE 503")
+
+
+def test_resume_hedge_stuck_marks_error_and_saves(tmp_path):
+    """M1：resume 补对冲时 HedgeStuck 原来一路抛出 run()，任务卡在 running、不存盘。"""
+    st = Store(tmp_path / "live.db")
+    sch, job, spot, clk, sent = mk("hedge_open", 3.0, perp=StuckPerp(), store=st)
+    st.add(job)
+    job.status = "running"
+    job.state.spot_qty, job.state.spot_cost, job.state.done = 2.0, 200.0, 1.0   # 现货多出一张没对冲
+    sch.run()
+    assert job.status == "error"
+    assert st.get(job.id).status == "error", "要存盘"
+    assert any("空单跟不上" in t and p == 1 for t, p in sent), sent
+
+
+class PartialSpot(Spot):
+    """挂单永远没人成交；吃单每次只成交六成。"""
+
+    def __init__(self):
+        super().__init__(step=0)
+
+    def take(self, side, qty, limit_px):
+        got = round(qty * 0.6, 3)
+        self.takes.append((side, got, limit_px))
+        px = self.ask if side == "buy" else self.bid
+        return OrderState(got, px, got * px * 0.003, False, "FILLED")
+
+
+def test_child_residual_is_reported_not_hidden():
+    """M2：补齐 / 退零头的吃单只成交一部分时，Ladder 照样 done/trimmed，零头没对冲却不报。"""
+    sch, job, spot, clk, sent = mk("hedge_open", 1.0, spot=PartialSpot(), perp=Perp(), min_slices=1)
+    sch.execute(1, 5.0)
+    left = job.state.spot_qty - job.state.done
+    assert abs(left) > 0.001, "这个场景本来就会剩零头"
+    assert any("未对冲零头" in t and p == 1 for t, p in sent), sent
+    assert "未对冲" in sch.summary_line()

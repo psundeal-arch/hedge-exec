@@ -287,7 +287,9 @@ def test_taker_only_leg_hedges_one_contract_at_a_time():
     r = ld.run()
     assert r.status == "done" and r.contracts == 3 and r.spot_qty == pytest.approx(15)
     assert spot.takes == [("buy", 5), ("buy", 5), ("buy", 5)]       # 逐张
-    assert perp.takes == [("sell", 1, perp.takes[0][2])] * 3 or len(perp.takes) == 3
+    # 原来这行是「X == [...] or len(...) == 3」，前半句拿被测列表自己的值比，后半句只查长度（审查 M9）
+    assert [(side, q) for side, q, _ in perp.takes] == [("sell", 1)] * 3, perp.takes   # 逐张、每次 1 张
+    assert all(lim is not None for _, _, lim in perp.takes), "第一档就成交，应带保护价而不是市价"
     assert r.max_unhedged <= CS + 1e-9 and max(unhedged) < 1e-9
 
 

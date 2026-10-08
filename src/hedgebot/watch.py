@@ -112,12 +112,23 @@ def run(cfg: Config, *, dry_run: bool = False, now: dt.datetime | None = None) -
 
     try:
         perps = coinbase.cde_perps()
-        rows, notes, errors = hedge_table(perps)
+        rows, notes, errors = hedge_table(perps, expected=cfg.venues)
     except SourceError as e:
         perps, rows, notes, errors = {}, [], [], [f"Coinbase 合约列表取数失败：{e}"]
 
     current: dict[str, tuple[str, int]] = {}
-    if errors:
+    from .account import MISSING
+    missing = [e for e in errors if e.startswith(MISSING)]
+    errors = [e for e in errors if not e.startswith(MISSING)]
+    if missing:
+        # 永久的配置问题：立刻报、走重发退避，不进连续失败计数（M4）。对齐照样评估不了
+        current["config"] = ("这台机器读不到下面这些场所的持仓 —— 两腿对齐【看不见】，等多久都不会自己好：\n"
+                             + "\n".join(m.removeprefix(MISSING) for m in missing)
+                             + "\n\n修：把对应 key 放进 ~/vault，或在 config.toml [watch] venues 里去掉这个场所", 0)
+    if missing and not errors:
+        log.append("凭据不全，本轮不评估对齐：" + "；".join(missing))
+        scope = {"config"}
+    elif errors:
         streak = int(st.get("fail_streak", "0")) + 1
         if not dry_run:
             st.put("fail_streak", streak)
@@ -126,7 +137,7 @@ def run(cfg: Config, *, dry_run: bool = False, now: dt.datetime | None = None) -
             current["blind"] = (
                 f"连续 {streak} 轮（约 {streak * 15} 分钟）没读全持仓，"
                 f"两腿是否对齐现在【看不见】，不是【没问题】。\n" + "\n".join(errors), 0)
-        scope = {"blind"}
+        scope = {"blind", "config"} if missing else {"blind"}
     else:
         if not dry_run:
             st.put("fail_streak", 0)
@@ -138,8 +149,9 @@ def run(cfg: Config, *, dry_run: bool = False, now: dt.datetime | None = None) -
 
     titles = {"new": "⚠ 两腿没对齐", "resend": "⚠ 仍未对齐", "recover": "✓ 已恢复"}
     for a in plan(current, scope, st.alerts(), cfg, now):
-        what = "监控看不见" if a.key == "blind" else a.key.split(":", 1)[1]
-        title = f"[hedge-bot] {titles[a.kind]}：{what}"
+        what = {"blind": "监控看不见", "config": "凭据缺失"}.get(a.key) or a.key.split(":", 1)[1]
+        head = titles[a.kind] if a.key.startswith("misalign:") else {"new": "⚠", "resend": "⚠ 仍然", "recover": "✓ 已恢复"}[a.kind]
+        title = f"[hedge-bot] {head}：{what}" if a.key.startswith("misalign:") else f"[hedge-bot] {head} {what}"
         msg = a.message
         if a.kind != "recover" and a.key.startswith("misalign:"):
             msg += ("\n\n可能原因：现货被卖出/转走、CDE 空单被部分强平、手动调仓只做了一腿。"

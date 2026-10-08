@@ -43,16 +43,33 @@ def price_unit(product: dict) -> float:
     return 1.0
 
 
+def _all_futures(page: int = 100) -> list[dict]:
+    """全部期货产品，按 offset 翻页（M6）。
+
+    接口单页最多给 100 个（limit=250 也只回 100），2026-10-08 全场正好 100 个 ——
+    再上一个新合约，单次请求就会把某个永续挤出去，所有命令报「CDE 没有 X 的永续」。
+    不信 pagination.has_next（实测恒为 False），一直翻到空页为止。"""
+    out, seen, off = [], set(), 0
+    while off < 5000:
+        body = request("GET", f"https://{HOST}{PRODUCTS}", "Coinbase 合约列表",
+                       params={"product_type": "FUTURE", "limit": page, "offset": off})
+        ps = [p for p in body.get("products") or [] if p.get("product_id") not in seen]
+        if not ps:
+            break
+        out += ps
+        seen |= {p.get("product_id") for p in ps}
+        off += len(ps)
+    return out
+
+
 def cde_perps() -> dict[str, dict]:
     """标的 -> 该标的的 CDE 永续。一个公开请求拿全部。
 
     CDE 的「永续」在接口里 contract_expiry_type 是 EXPIRING（到期日设在
     2030 年），和月度交割合约的区别是有 funding_interval。
     """
-    body = request("GET", f"https://{HOST}{PRODUCTS}", "Coinbase 合约列表",
-                   params={"product_type": "FUTURE", "limit": 250})
     out: dict[str, dict] = {}
-    for p in body.get("products") or []:
+    for p in _all_futures():
         d = p.get("future_product_details") or {}
         if d.get("venue") != "cde" or not d.get("funding_interval"):
             continue

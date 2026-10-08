@@ -101,3 +101,48 @@ def test_grid_only_perp_is_not_aligned_or_alerted():
     assert r["flag"] == "网格实盘（不对齐）" and not r["problem"]
     r = classify([row("SUI", 0.0, -2000.0, px=1.18)], cfg())[0]
     assert r["problem"]
+
+
+# --- M4 / M9：watch.run 的状态机 ---------------------------------------------------
+
+def _run_env(tmp_path, monkeypatch, table):
+    from hedgebot import watch
+    sent = []
+    monkeypatch.setattr(watch.coinbase, "cde_perps", lambda: {})
+    monkeypatch.setattr(watch, "hedge_table", table)
+    monkeypatch.setattr(watch.notify, "send", lambda t, m, p=0: (sent.append((t, p)), (True, []))[1])
+    c = cfg(db_path=tmp_path / "paper.db", blind_after=3)
+    return watch, c, sent
+
+
+def test_missing_credentials_alert_immediately_not_after_streak(tmp_path, monkeypatch):
+    """M4：缺凭据是配置问题，等多久都不会好 —— 第一轮就报「凭据缺失」，不进连续失败计数。"""
+    from hedgebot.account import MISSING
+    watch, c, sent = _run_env(tmp_path, monkeypatch,
+                              lambda perps, expected=None: ([], [], [MISSING + "没有 RH_API_KEY"]))
+    watch.run(c, now=NOW)
+    assert any("凭据缺失" in t for t, _ in sent), sent
+    assert watch.State(tmp_path / "watch.db").get("fail_streak", "0") == "0"
+    assert not any("没对齐" in t for t, _ in sent), "配置错误不能用「两腿没对齐」的标题"
+
+
+def test_transient_errors_alert_only_after_blind_after(tmp_path, monkeypatch):
+    """临时取数失败照旧：连续 blind_after 轮才报「监控看不见」。"""
+    watch, c, sent = _run_env(tmp_path, monkeypatch,
+                              lambda perps, expected=None: ([], [], ["Kraken 余额取数失败：502"]))
+    for i in range(2):
+        watch.run(c, now=NOW + dt.timedelta(minutes=15 * i))
+    assert not sent
+    watch.run(c, now=NOW + dt.timedelta(minutes=30))
+    assert any("监控看不见" in t for t, _ in sent), sent
+
+
+def test_unexpected_venue_missing_is_only_a_note(monkeypatch):
+    """名单外的场所缺凭据：只记提示，不算错误。"""
+    from hedgebot import account
+    for k in ("KRAKEN_API_KEY", "KRAKEN_API_SECRET", "RH_API_KEY", "RH_PRIVATE_KEY",
+              "COINBASE_API_KEY_NAME", "COINBASE_API_PRIVATE_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    rows, notes, errors = account.hedge_table({}, expected=("coinbase",))
+    assert [e for e in errors if "COINBASE" in e] and not [e for e in errors if "KRAKEN" in e or "RH_" in e]
+    assert any("kraken" in n for n in notes) and any("robinhood" in n for n in notes)

@@ -47,6 +47,7 @@ class Config:
     min_alert_usd: float = 200.0
     blind_after: int = 3
     resend_hours: tuple[float, ...] = (1, 3, 6, 12, 24)
+    venues: tuple[str, ...] = ("kraken", "robinhood", "coinbase")   # 本机应该读得到的场所
     live: Live = Live()
 
 
@@ -77,6 +78,7 @@ def load_config(path: Path | None = None) -> Config:
         min_alert_usd=float(watch.get("min_alert_usd", 200)),
         blind_after=int(watch.get("blind_after", 3)),
         resend_hours=tuple(float(x) for x in watch.get("resend_hours", (1, 3, 6, 12, 24))),
+        venues=tuple(str(v).lower() for v in watch.get("venues", ("kraken", "robinhood", "coinbase"))),
         live=Live(**{k: tuple(float(x) for x in v) if isinstance(v, list) else float(v)
                      for k, v in raw.get("live", {}).items()}),
     )

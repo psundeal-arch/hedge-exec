@@ -48,3 +48,35 @@ def test_load_env_reads_vault_whitelist_after_dotenv(tmp_path, monkeypatch):
     assert os.environ["PUSHOVER_TOKEN"] == "from_dotenv", ".env 在的时候它说了算"
     assert os.environ["X_ONLY_VAULT"] == "v", "vault 补缺口"
     assert "COINBASE_TRADE_KEY_NAME" not in os.environ, "交易密钥不在白名单里"
+
+
+def test_all_futures_pages_until_empty(monkeypatch):
+    """M6：接口单页最多 100 个，全场正好 100 个 —— 再多一个就会挤掉某个永续。翻页直到空页。"""
+    from hedgebot import coinbase
+    allp = [{"product_id": f"P{i}"} for i in range(230)]
+    calls = []
+
+    def fake(method, url, label, params=None, **k):
+        calls.append(params["offset"])
+        o, n = params["offset"], min(params["limit"], 100)
+        return {"products": allp[o:o + n], "pagination": {"has_next": False}}  # has_next 不可信
+    monkeypatch.setattr(coinbase, "request", fake)
+    got = coinbase._all_futures(page=250)
+    assert len(got) == 230 and calls == [0, 100, 200, 230]
+
+
+def test_market_survives_one_bad_kraken_pair(monkeypatch):
+    """M7：config 里一个写错的 Kraken 交易对，原来让整张 hedge market 表全灭。"""
+    from hedgebot import coinbase, kraken, market
+    from hedgebot.http import SourceError
+
+    def pair_info(pairs):
+        if "BADUSD" in pairs:
+            raise SourceError("EQuery:Unknown asset pair")
+        return {p: {} for p in pairs}
+    monkeypatch.setattr(kraken, "pair_info", pair_info)
+    monkeypatch.setattr(coinbase, "cde_perps", lambda: {})
+    cfg = CFG.__class__(**{**CFG.__dict__, "symbols": {"ZEC": "ZECUSD", "BAD": "BADUSD"}})
+    quotes, skipped = market.fetch_quotes(cfg, ["ZEC", "BAD"])
+    assert any("BADUSD" in s for s in skipped), skipped
+    assert any(s.startswith("ZEC") for s in skipped), "好的那个照常往下走（这里因为没有 CDE 永续被跳过）"
