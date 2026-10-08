@@ -97,6 +97,14 @@ class RHTrader:
     def cancel(self, oid: str) -> None:
         self._call("POST", f"/api/v2/crypto/trading/orders/{oid}/cancel/", f"Robinhood 撤单 {oid}")
 
+    def open_orders(self, symbol: str, days: float = 30) -> list[dict]:
+        """该交易对还没到终态的订单（H7：进程死在「下 GTC 限价 → 等 → 撤」中间会留下孤儿单）。"""
+        start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+        q = urllib.parse.urlencode({"account_number": self.account()["account_number"],
+                                    "symbol": symbol, "created_at_start": start})
+        res = self._call("GET", f"/api/v2/crypto/trading/orders/?{q}", "Robinhood 订单列表")
+        return [o for o in res.get("results") or [] if o.get("state") in OPEN_STATES]
+
     # ---------------------------------------------------------------- 下单
     def place(self, side: str, symbol: str, qty_str: str, limit_px: str | None = None,
               client_order_id: str | None = None) -> dict:
@@ -147,7 +155,19 @@ class RobinhoodLeg:
         p = trader.pair(symbol)
         self.lot, self.tick = p["step"], p["tick"]
         self.min_usd = p["min_usd"]
-        self.min_qty = p["step"]
+        self._px: float | None = None              # 最近一次盘口中价，折算美元下限用
+
+    @property
+    def min_qty(self) -> float:
+        """最小下单量 = max(数量步长, 美元下限 ÷ 现价)（H7：原来只看步长，低于美元下限的
+        分片单发出去才被拒）。还没看过盘口时只能按步长。"""
+        import math
+        if not (self._px and self.min_usd):
+            return self.lot
+        return max(self.lot, math.ceil(self.min_usd * 1.01 / self._px / self.lot - 1e-9) * self.lot)
+
+    def open_orders(self) -> list[dict]:
+        return self.t.open_orders(self.symbol)
 
     def book(self):
         from .book import Book
@@ -155,6 +175,8 @@ class RobinhoodLeg:
                            + urllib.parse.urlencode({"symbol": self.symbol}),
                            f"Robinhood 盘口 {self.symbol}").get("results") or [{}])[0]
         bid, ask = float(bb.get("bid") or 0), float(bb.get("ask") or 0)
+        if bid and ask:
+            self._px = (bid + ask) / 2
         # Robinhood 只给一档（跨合作交易所的最优价），没有深度 —— 数量填一个大数，
         # 深度由下单后实际成交量说话
         return Book(bids=((bid, 1e12),) if bid else (), asks=((ask, 1e12),) if ask else ())
@@ -191,6 +213,10 @@ class RobinhoodLeg:
         except SourceError as e:
             raise OrderUnknown(f"robinhood 订单 {oid} 已提交，查询/撤单出错（{e}）",
                                leg=self.name, side=side, qty=qty, oid=oid) from e
+        if o.get("state") in OPEN_STATES:
+            # 撤了还挂着：不能当成「结束了」返回 —— 那就是一张没人管的活单（H7）。交给对账
+            raise OrderUnknown(f"robinhood 订单 {oid} 撤单后 10 秒仍是 {o.get('state')}",
+                               leg=self.name, side=side, qty=qty, oid=oid)
         return self._state(o)
 
     def find(self, u) -> str | None:

@@ -385,6 +385,12 @@ def cmd_rh_order(cfg, args) -> None:
         blockers.append(f"金额 ${notional:.2f} 低于最小下单金额 ${pr['min_usd']:g}")
     if notional and notional > cfg.live.max_notional_usd:
         blockers.append(f"金额 ${notional:,.0f} 超过上限 ${cfg.live.max_notional_usd:,.0f}")
+    from .live import leftover_orders
+    from .rh_trade import RobinhoodLeg
+    try:
+        blockers += leftover_orders(RobinhoodLeg(t, pair_sym), notes)
+    except SourceError as e:
+        notes.append(f"查不到 Robinhood 未完成订单：{e}")
     limit_str = None
     if args.limit is not None:
         limit_str = fmt_step(args.limit, pr["tick"]) if pr else f"{args.limit:g}"

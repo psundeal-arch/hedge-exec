@@ -142,6 +142,24 @@ def session_risk(perp: dict, now: dt.datetime, window_s: float) -> str | None:
     return None
 
 
+def leftover_orders(spot, warns: list) -> list[str]:
+    """Robinhood 上这个交易对还挂着没到终态的单 → 拦下（H7）。
+
+    RH 没有 IOC，「带保护价的吃单」是下 GTC 限价 → 等 → 撤；进程死在中间就留下一张
+    没人管的活单，它之后成交不会被记账。新一轮开始前先把它找出来，让人处理掉。"""
+    if not hasattr(spot, "open_orders"):
+        return []
+    try:
+        left = spot.open_orders()
+    except Exception as e:                                       # noqa: BLE001
+        warns.append(f"查不到 Robinhood 未完成订单（{type(e).__name__}）—— 去 App 看一眼有没有挂着的单")
+        return []
+    return [f"Robinhood {spot.symbol} 还有未完成的订单：{o.get('side')} "
+            f"{o.get('limit_order_config', {}).get('asset_quantity') or o.get('market_order_config', {}).get('asset_quantity')}"
+            f"（{o.get('state')}，{o.get('created_at', '')[:16]}，id {o.get('id')}）—— 先在 App 里撤掉或等它成交"
+            for o in left]
+
+
 def fixed_fee_bp(cfg: Config, per_contract_usd: float) -> float:
     """CDE 每张固定费折成 bp/边。按张收、和名义无关，所以合约越小越贵。"""
     return cfg.fees.cde_per_contract / per_contract_usd * 1e4 if per_contract_usd > 0 else float("inf")
@@ -193,6 +211,7 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
         blockers.append(f"现货 {qty:g} 低于最小下单量 {spot.min_qty:g}")
     if args.action == "open" and (why := fixed_fee_blocker(cfg, cs * pb.mid)):
         blockers.append(why)
+    blockers += leftover_orders(spot, warns)
 
     previews = {}
     bal = None

@@ -205,3 +205,64 @@ def test_http_distinguishes_rejection_from_unknown(monkeypatch):
     monkeypatch.setattr(h.requests, "request", boom)
     with pytest.raises(TransientError):                   # 结果不明
         h.request("POST", "u", "t", attempts=1)
+
+
+# --- H7：Robinhood 腿 --------------------------------------------------------------
+
+class _FakeRH:
+    """RHTrader 的最小替身：下单后一直挂着，撤单也撤不掉（交易所卡住）。"""
+
+    def __init__(self, stuck=True):
+        self.stuck, self.cancelled, self.placed = stuck, [], []
+
+    def pair(self, sym):
+        return {"step": 0.001, "tick": 0.01, "min_usd": 1.0}
+
+    def place(self, side, symbol, qty, px, client_order_id=None):
+        self.placed.append((side, qty, px))
+        return {"id": "rh1"}
+
+    def wait(self, oid, timeout_s=10):
+        return {"id": oid, "state": "open" if self.stuck else "filled", "filled_asset_quantity": "0"}
+
+    def cancel(self, oid):
+        self.cancelled.append(oid)
+
+    def _call(self, *a, **k):
+        return {"results": [{"bid": "100", "ask": "100.02"}]}
+
+
+def test_rh_take_does_not_return_a_still_open_order():
+    """撤了 10 秒还挂着的单，原来被当成「结束了」返回 —— 那是一张没人管的活单。"""
+    from hedgebot.rh_trade import RobinhoodLeg
+    from hedgebot.trade_api import OrderUnknown
+    leg = RobinhoodLeg(_FakeRH(stuck=True), "LTC-USD")
+    with pytest.raises(OrderUnknown) as ei:
+        leg.take("buy", 1.0, 101.0)
+    assert ei.value.oid == "rh1", "要带着订单号交给对账"
+
+
+def test_rh_min_qty_respects_dollar_minimum():
+    """最小下单量要按美元下限折算，原来只看数量步长。"""
+    from hedgebot.rh_trade import RobinhoodLeg
+    fake = _FakeRH()
+    fake.pair = lambda s: {"step": 0.001, "tick": 0.01, "min_usd": 10.0}
+    leg = RobinhoodLeg(fake, "LTC-USD")
+    assert leg.min_qty == 0.001                                  # 没看过盘口：只能按步长
+    leg.book()                                                   # 中价 100.01
+    assert leg.min_qty == pytest.approx(0.101), "$10 × 1.01 ÷ 100.01 = 0.10099，按步长向上取整"
+
+
+def test_preflight_blocks_on_leftover_rh_orders():
+    from hedgebot.live import leftover_orders
+
+    class Leg:
+        symbol = "LTC-USD"
+
+        def open_orders(self):
+            return [{"id": "x1", "side": "buy", "state": "open", "created_at": "2026-10-08T12:00:00Z",
+                     "limit_order_config": {"asset_quantity": "5"}}]
+    warns = []
+    b = leftover_orders(Leg(), warns)
+    assert b and "x1" in b[0] and "未完成" in b[0]
+    assert leftover_orders(object(), warns) == [], "不是 RH 腿就不查"
