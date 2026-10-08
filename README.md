@@ -1,11 +1,13 @@
 # hedge-bot
 
-Kraken 现货多 + Coinbase CDE 永续空，两条腿的对冲工具。
+现货多（Coinbase / Kraken / Robinhood）+ Coinbase CDE 永续空，两条腿的对冲工具。
 
-**当前阶段：只读监控 + 模拟盘，不会下任何真实订单。** 所有 API key 都只要只读权限。
+**会下真实订单**（审查 M17：原来这里写着「只读、不下单」，早已不成立）：
+- `hedge live open|close … --go`、`hedge rh-order … --go`：在**本机**跑，交易 key 在本机 `.env.trade`，终端手输确认。
+- `hedge exec`（服务器常驻 `hedge-exec.service`）：用服务器 IP 绑定的 Coinbase 交易 key（`HEDGE_EXEC_KEYS`）。
+- 其余（`account` / `market` / `scan` / `watch` / `paper`）只读或模拟。
 
-现货腿可以分散在 Kraken（可质押）和 Robinhood，`account` 会把它们加总后与 CDE 空单对齐。
-Robinhood 只做持仓读取；`paper` 模拟盘的现货腿目前只按 Kraken 的订单簿成交。
+现货腿可以分散在 Coinbase、Kraken（可质押）和 Robinhood，`account` 会把它们加总后与 CDE 空单对齐。
 
 **perp-track 已并入本仓库**（2026-10-02，保留完整历史）：代码在 `src/perptrack/`，配置 `perp-track.toml`，说明见 [docs/perp-track.md](docs/perp-track.md)。两者仍是各自独立的进程。
 
@@ -86,7 +88,9 @@ CDE 手续费 = 比例费 + 每张固定费（2026-10-01 用 91 笔真实 maker 
 - **取数有任何一边失败 → 本轮不评估对齐**。否则 Robinhood 一抖，现货读成 0，就是一条假的
   「裸空」报警。已有的报警记录原样保留，连续 3 轮（45 分钟）失败才报「监控看不见」。
 - **进程本身崩溃** → `hedge-bot-failed@<单元>.service` 用裸 curl 发 Pushover，文案和节流按单元分开，每个单元 6 小时内最多一次（watch、exec、perp-track 日报都接了）。
-- 通知凭据读 `~/perp-track/.env`，不复制密钥。报警状态在 `data/watch.db`。
+- 凭据在服务器 `~/vault`（2026-10-06 集中，目录 700、文件 600）：单元按需挂 `coinbase-view` /
+  `kraken-view` / `robinhood-view` / `notify`，部署不推送任何凭据，只校验（见 `deploy/deploy.sh`）。
+  本机照旧用仓库根的 `.env`（模板 `.env.example`）。报警状态在 `data/watch.db`。
 
 ## 真实下单（live）
 

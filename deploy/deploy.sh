@@ -149,7 +149,7 @@ if ! ssh "$TARGET" bash -s -- "$REMOTE_DIR" <<'REMOTE'
 set -euo pipefail
 cd "$1"
 python3 -m venv .venv
-.venv/bin/pip install -q -e '.[dev]'
+.venv/bin/pip install -q -e '.[dev]' -c deploy/constraints.txt
 .venv/bin/python -m pytest tests/ -q -p no:cacheprovider 2>&1 | tail -1
 REMOTE
 then

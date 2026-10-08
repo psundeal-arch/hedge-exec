@@ -19,6 +19,9 @@ cd ~/hedge-bot
 
 提交时跑和 `hedge live` 一样的预检（名义上限、保证金、余额、会话风险），打印执行计划，然后要你**手输 `EXEC ZEC 2`** 确认。
 加 `--dry` 就是演练：盯真实行情、用模拟腿成交，不下单、不用确认。
+演练的成交记在 `data/live.db`（`runs.mode = paper`），**不进 `hedge paper` 的模拟盘**（审查 M3/M8：
+`hedge paper` 是另一套引擎 `executor.run_pair`，练的不是实盘那套）。看演练结果用
+`hedge exec status` / `hedge exec report <id>` / `hedge exec quality --mode paper`。
 
 | 参数 | 默认 | 含义 |
 |---|---|---|

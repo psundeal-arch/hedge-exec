@@ -3,6 +3,9 @@ Description=hedge exec worker（日内执行算法：你定量，程序在时间
 After=network-online.target
 Wants=network-online.target
 OnFailure=hedge-bot-failed@%n.service
+# 崩溃重启有上限（审查 M18）：30 分钟内失败 5 次就进 failed、触发传呼，不再每 60 秒无限重启
+StartLimitIntervalSec=1800
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -17,6 +20,11 @@ KillSignal=SIGTERM
 TimeoutStopSec=330
 Restart=on-failure
 RestartSec=60
+# 这个单元能读到交易 key：最小化它能做的事（审查 M18）。ProtectSystem 之类要用户命名空间，
+# 在 user 单元里有起不来的风险 —— exec 起不来的代价比这点加固大，故不加
+NoNewPrivileges=yes
+UMask=0077
+MemoryMax=1G
 
 [Install]
 WantedBy=default.target

@@ -7,7 +7,6 @@ OnFailure=hedge-bot-failed@%n.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/hedge-bot
-# perp-track 已并入本仓库，两边共用这一份 .env（通知凭据 + 只读 key）
 # 凭据在服务器 ~/vault（2026-10-06 集中）。只挂要用的几份，且【不加 -】：
 # 文件缺了单元直接起不来、触发 OnFailure，而不是静默少掉变量、告警无声失效
 EnvironmentFile=%h/vault/coinbase-view.env
@@ -15,4 +14,5 @@ EnvironmentFile=%h/vault/kraken-view.env
 EnvironmentFile=%h/vault/robinhood-view.env
 EnvironmentFile=%h/vault/notify.env
 ExecStart=%h/hedge-bot/.venv/bin/hedge watch
-TimeoutStartSec=300
+# 每条告警最坏约 111 秒（Pushover/Discord/邮件串行、各自重试），几条同时出就会超过 300 秒（审查 M18）
+TimeoutStartSec=600
