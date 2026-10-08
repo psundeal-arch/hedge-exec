@@ -2,7 +2,7 @@
 Description=hedge exec worker（日内执行算法：你定量，程序在时间窗内挑时机分批做完）
 After=network-online.target
 Wants=network-online.target
-OnFailure=hedge-bot-failed.service
+OnFailure=hedge-bot-failed@%n.service
 
 [Service]
 Type=simple

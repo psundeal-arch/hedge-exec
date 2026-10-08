@@ -2,7 +2,7 @@
 Description=hedge-bot watch（两腿对齐报警 + 模拟盘记资金费）
 After=network-online.target
 Wants=network-online.target
-OnFailure=hedge-bot-failed.service
+OnFailure=hedge-bot-failed@%n.service
 
 [Service]
 Type=oneshot

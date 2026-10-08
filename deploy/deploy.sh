@@ -28,7 +28,7 @@ REMOTE_DIR="${2:-hedge-bot}"
 LOCAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 UNITS="perp-track.service perp-track.timer perp-track-funding.service perp-track-funding.timer \
 perp-track-watch.service perp-track-watch.timer perp-track-pager-failed.service \
-hedge-bot-watch.service hedge-bot-watch.timer hedge-bot-failed.service hedge-exec.service"
+hedge-bot-watch.service hedge-bot-watch.timer hedge-bot-failed@.service hedge-exec.service"
 TIMERS="perp-track.timer perp-track-funding.timer perp-track-watch.timer hedge-bot-watch.timer"
 
 CONFIGS="config.toml perp-track.toml"
@@ -183,6 +183,7 @@ fi
 echo "==> 安装 systemd user 单元"
 ssh "$TARGET" "mkdir -p ~/.config/systemd/user && \
   for u in $UNITS; do cp $REMOTE_DIR/deploy/\$u ~/.config/systemd/user/; done && \
+  rm -f ~/.config/systemd/user/hedge-bot-failed.service && \
   systemctl --user daemon-reload && \
   for t in $TIMERS; do systemctl --user enable --now \$t; done && \
   systemctl --user enable hedge-exec.service && systemctl --user restart hedge-exec.service"

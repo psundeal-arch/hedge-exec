@@ -33,7 +33,9 @@ cde_maker = 0.00055
 cde_per_contract = 0.12
 
 [risk]
-# 任一腿的成交均价偏离中间价超过这么多基点，整笔不做（两腿都不下）
+# 【只作用于 hedge paper open/close（executor.run_pair）】：任一腿的成交均价偏离中间价超过这么多
+# 基点，整笔不做。实盘（hedge live / exec，ladder.py）不读它 —— 实盘空单跟进按 [live]
+# hedge_escalation_bps 逐档放宽、最后市价，现货腿的价格保护是 exec --limit（审查 H10）
 max_slippage_bps = 30
 # 实盘对齐检查：|现货数量 - 空单数量| / 现货数量 超过这个就标红
 hedge_tolerance = 0.02
