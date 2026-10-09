@@ -175,6 +175,14 @@ def fixed_fee_blocker(cfg: Config, per_contract_usd: float) -> str | None:
     return None
 
 
+def _fixed_fee(args, why: str, blockers: list, warns: list) -> None:
+    """固定费超上限：默认拦；--accept-fixed-fee 只对这一笔放行，照样把账印出来（不改配置，不会忘了改回去）。"""
+    if getattr(args, "accept_fixed_fee", False):
+        warns.append(f"【已用 --accept-fixed-fee 放行】{why}")
+    else:
+        blockers.append(why + "；确认要做：这一笔加 --accept-fixed-fee")
+
+
 def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
     """所有能在下单前查的都查一遍。返回计划；有致命问题时 plan['blockers'] 非空。"""
     sym = args.symbol.upper()
@@ -210,7 +218,7 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
     if qty < spot.min_qty:
         blockers.append(f"现货 {qty:g} 低于最小下单量 {spot.min_qty:g}")
     if args.action == "open" and (why := fixed_fee_blocker(cfg, cs * pb.mid)):
-        blockers.append(why)
+        _fixed_fee(args, why, blockers, warns)
     blockers += leftover_orders(spot, warns)
 
     previews = {}
@@ -361,7 +369,7 @@ def perp_only(cfg: Config, args) -> None:
     if notional > cfg.live.max_notional_usd:
         blockers.append(f"名义 ${notional:,.0f} 超过上限 ${cfg.live.max_notional_usd:,.0f}")
     if args.action == "open" and ref and (why := fixed_fee_blocker(cfg, cs * ref)):
-        blockers.append(why)
+        _fixed_fee(args, why, blockers, warns)
     if args.action == "close":
         try:
             held = sum(r["contracts"] for r in coinbase.positions(cb_auth.key_name, cb_auth.key_secret)

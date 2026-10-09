@@ -589,6 +589,8 @@ def main(argv=None) -> None:
     lv.add_argument("--finish", choices=["complete", "trim"], default="complete",
                     help="挂单超时后：complete 吃单补齐（默认）/ trim 退掉凑不满一张的零头")
     lv.add_argument("--max-wait", type=float, help="挂单最多等多少秒（默认见 config）")
+    lv.add_argument("--accept-fixed-fee", action="store_true",
+                    help="每张固定费超过 [live] max_fixed_fee_bp 时，只对这一笔放行（开仓才会被它拦）")
     m = lv.add_mutually_exclusive_group()
     m.add_argument("--go", action="store_true", help="真实下单（会要求手输确认）")
     m.add_argument("--paper", action="store_true",

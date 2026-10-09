@@ -80,3 +80,31 @@ def test_market_survives_one_bad_kraken_pair(monkeypatch):
     quotes, skipped = market.fetch_quotes(cfg, ["ZEC", "BAD"])
     assert any("BADUSD" in s for s in skipped), skipped
     assert any(s.startswith("ZEC") for s in skipped), "好的那个照常往下走（这里因为没有 CDE 永续被跳过）"
+
+
+def test_accept_fixed_fee_is_a_one_shot_override(monkeypatch):
+    """固定费超上限默认拦；--accept-fixed-fee 只对这一笔放行，账照样印出来。"""
+    import types
+    from hedgebot import live
+    from hedgebot.book import Book
+
+    class Leg:
+        min_qty, lot, name = 0.01, 0.01, "kraken"
+
+        def __init__(self, px):
+            self.px = px
+
+        def book(self):
+            return Book(bids=((self.px, 1e6),), asks=((self.px * 1.0002, 1e6),))
+    p = {"contract_size": 10.0, "product_id": "AVP-PERP", "funding_rate": 1e-5, "session_open": True,
+         "trading_disabled": False, "unit": 1.0, "margin_short_overnight": 0.45}
+    monkeypatch.setattr(live, "build", lambda *a, **k: (p, Leg(10.9), Leg(10.9), None, lambda: {}, 0.0025, []))
+    monkeypatch.setattr(live, "session_risk", lambda *a: None)
+    ns = types.SimpleNamespace(symbol="AVAX", spot="kraken", perp="cde", contracts=1, usd=None, action="open",
+                               max_wait=300, paper=True, finish="complete")
+    plan = live.preflight(CFG, ns, need_trade=False)
+    assert any("bp/边" in b and "--accept-fixed-fee" in b for b in plan["blockers"]), plan["blockers"]
+    ns.accept_fixed_fee = True
+    plan = live.preflight(CFG, ns, need_trade=False)
+    assert not any("bp/边" in b for b in plan["blockers"]), "放行后不再是阻断项"
+    assert any("已用 --accept-fixed-fee 放行" in w for w in plan["warnings"]), "账要照样印出来"
