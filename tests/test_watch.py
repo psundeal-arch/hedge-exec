@@ -153,7 +153,7 @@ def test_unexpected_venue_missing_is_only_a_note(monkeypatch):
 def _unstake_env(tmp_path, monkeypatch, avail):
     from hedgebot import robinhood
     watch, c, sent = _run_env(tmp_path, monkeypatch, lambda perps, expected=None: ([], [], []))
-    c = c.__class__(**{**c.__dict__, "unstake_targets": {"ETH": 4.5}})
+    c = c.__class__(**{**c.__dict__, "unstake_targets": {"ETH": 4.5}})          # 不写场所 = robinhood
     monkeypatch.setenv("RH_API_KEY", "k")
     monkeypatch.setenv("RH_PRIVATE_KEY", "s")
     calls = []
@@ -193,3 +193,19 @@ def test_unstake_reminder_survives_fetch_failure(tmp_path, monkeypatch):
     watch.run(c, now=NOW + dt.timedelta(minutes=30))
     assert len(sent) == 1, "取数抖一下不该把已发的提醒清掉、再当新的重发"
     assert not any("已恢复" in t for t, _ in sent)
+
+
+def test_kraken_redeem_reminder(tmp_path, monkeypatch):
+    """Kraken Earn 赎回：看余额里不带后缀（可用）那份，到数就提醒。"""
+    from hedgebot import kraken
+    watch, c, sent = _run_env(tmp_path, monkeypatch, lambda perps, expected=None: ([], [], []))
+    c = c.__class__(**{**c.__dict__, "unstake_targets": {"kraken:USDC": 260.0}})
+    monkeypatch.setenv("KRAKEN_API_KEY", "k")
+    monkeypatch.setenv("KRAKEN_API_SECRET", "s")
+    state = {"bal": {"USDC": {"": 0.05}, "AVAX": {"B": 250.0}}}
+    monkeypatch.setattr(kraken, "balances", lambda k, s: state["bal"])
+    watch.run(c, now=NOW)
+    assert not sent
+    state["bal"] = {"USDC": {"": 262.3}}
+    watch.run(c, now=NOW + dt.timedelta(minutes=15))
+    assert any("Kraken 赎回到账" in t and "USDC" in t for t, _ in sent), sent

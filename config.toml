@@ -85,6 +85,8 @@ resend_hours = [1, 3, 6, 12, 24]
 # 本机应该读得到持仓的场所。缺凭据时：名单内 → 立即报「配置错误」（不是等 45 分钟报「看不见」，
 # 等多久都不会自己好）；名单外 → 只记一条提示、不算失败（M4）
 venues = ["kraken", "robinhood", "coinbase"]
-# Robinhood 解押提醒：可卖数量（quantity_available_for_trading）达到这个数就 Pushover 通知，
-# 之后按 resend_hours 退避提醒，直到从这里删掉。2026-10-09：ETH 要解押 4.5 枚才能平对冲腿
-unstake_targets = { ETH = 4.5 }
+# 解押 / 赎回到账提醒：「场所:币」的【可用】数量达到这个数就 Pushover 通知（不写场所 = robinhood），
+# 之后按 resend_hours 退避提醒，直到从这里删掉。
+#   robinhood:ETH  2026-10-09：ETH 要解押 4.5 枚才能平对冲腿
+#   kraken:USDC    2026-10-09：USDC Earn 赎回约 260，到账后换 USD 买 AVAX（+1 张对冲）
+unstake_targets = { "robinhood:ETH" = 4.5, "kraken:USDC" = 260 }

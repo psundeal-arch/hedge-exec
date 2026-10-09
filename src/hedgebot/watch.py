@@ -147,31 +147,48 @@ def run(cfg: Config, *, dry_run: bool = False, now: dt.datetime | None = None) -
         log.append(f"对齐检查：{len(rows)} 个标的，{len(bad)} 个有问题")
         scope = None
 
-    # Robinhood 解押提醒：和对齐检查互不影响（各自取数、各自 scope）
+    # 解押 / 赎回到账提醒（[watch] unstake_targets）：和对齐检查互不影响（各自取数、各自 scope）。
+    # 键写「场所:币」，不写场所默认 robinhood。只看【可用】数量：RH 是 quantity_available_for_trading，
+    # Kraken 是余额里不带后缀的那份（Earn 里赎回中的钱不在里面，到账才出现）
     if cfg.unstake_targets:
         import os
-        from . import robinhood
-        rk, rs = os.environ.get("RH_API_KEY"), os.environ.get("RH_PRIVATE_KEY")
-        try:
-            if not (rk and rs):
-                raise SourceError("没有 RH_API_KEY / RH_PRIVATE_KEY")
-            av = robinhood.holdings(rk, rs, available=True)
-            for sym, need in cfg.unstake_targets.items():
-                have = av.get(sym, 0.0)
-                log.append(f"RH {sym} 可卖 {have:g} / 等 {need:g}")
-                if have >= need - 1e-9:
-                    current[f"unstake:{sym}"] = (
-                        f"Robinhood 上 {sym} 现在可卖 {have:g}（≥ {need:g}）—— 解押到账了。\n"
-                        f"平对冲腿（先预检，再加 --go）：\n"
-                        f"hedge live close {sym} --spot robinhood --perp cde --contracts N\n"
-                        f"做完后把 config.toml [watch] unstake_targets 里的 {sym} 删掉，提醒就停", 1)
-            scope = None if scope is None else scope | {"unstake"}
-        except SourceError as e:
-            log.append(f"RH 解押提醒取数失败：{e}")
-            # 这轮没读到：已发过的提醒原样保留（不当成「条件消失」清掉，否则下轮又按新的重发）
-            for k, rec in st.alerts().items():
-                if k.startswith("unstake:"):
-                    current[k] = (rec["detail"], 1)
+        from . import kraken, robinhood
+        by_venue: dict[str, dict[str, float]] = {}
+        for key, need in cfg.unstake_targets.items():
+            venue, _, sym = key.rpartition(":")
+            by_venue.setdefault((venue or "robinhood").lower(), {})[sym.upper()] = need
+        for venue, targets in by_venue.items():
+            try:
+                if venue == "robinhood":
+                    rk, rs = os.environ.get("RH_API_KEY"), os.environ.get("RH_PRIVATE_KEY")
+                    if not (rk and rs):
+                        raise SourceError("没有 RH_API_KEY / RH_PRIVATE_KEY")
+                    av = robinhood.holdings(rk, rs, available=True)
+                    label, hint = "Robinhood", "解押到账"
+                elif venue == "kraken":
+                    kk, ks = os.environ.get("KRAKEN_API_KEY"), os.environ.get("KRAKEN_API_SECRET")
+                    if not (kk and ks):
+                        raise SourceError("没有 KRAKEN_API_KEY / KRAKEN_API_SECRET")
+                    av = {a: parts.get("", 0.0) for a, parts in kraken.balances(kk, ks).items()}
+                    label, hint = "Kraken", "赎回到账"
+                else:
+                    raise SourceError(f"不认识的场所 {venue}（只支持 robinhood / kraken）")
+                for sym, need in targets.items():
+                    have = av.get(sym, 0.0)
+                    log.append(f"{label} {sym} 可用 {have:g} / 等 {need:g}")
+                    if have >= need - 1e-9:
+                        nxt = (f"平对冲腿（先预检，再加 --go）：\nhedge live close {sym} --spot robinhood --perp cde --contracts N"
+                               if venue == "robinhood" else "可以接着做要用这笔钱的那一步了")
+                        current[f"unstake:{venue}:{sym}"] = (
+                            f"{label} 上 {sym} 现在可用 {have:g}（≥ {need:g}）—— {hint}了。\n{nxt}\n"
+                            f"做完后把 config.toml [watch] unstake_targets 里的这一项删掉，提醒就停", 1)
+                scope = None if scope is None else scope | {f"unstake:{venue}:"}
+            except SourceError as e:
+                log.append(f"{venue} 到账提醒取数失败：{e}")
+                # 这轮没读到：已发过的提醒原样保留（不当成「条件消失」清掉，否则下轮又按新的重发）
+                for k, rec in st.alerts().items():
+                    if k.startswith(f"unstake:{venue}:"):
+                        current[k] = (rec["detail"], 1)
 
     titles = {"new": "⚠ 两腿没对齐", "resend": "⚠ 仍未对齐", "recover": "✓ 已恢复"}
     for a in plan(current, scope, st.alerts(), cfg, now):
@@ -180,7 +197,8 @@ def run(cfg: Config, *, dry_run: bool = False, now: dt.datetime | None = None) -
                 if not dry_run:
                     st.drop(a.key)
                 continue
-            title = f"[hedge-bot] 🔔 RH 解押到账：{a.key.split(':', 1)[1]}"
+            _, venue, sym = a.key.split(":", 2)           # unstake:<场所>:<币>
+            title = f"[hedge-bot] 🔔 {'RH 解押' if venue == 'robinhood' else venue.capitalize() + ' 赎回'}到账：{sym}"
             if dry_run:
                 log.append(f"[dry-run] 会发 {title}\n{a.message}")
                 continue
