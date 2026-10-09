@@ -65,8 +65,10 @@ def _all_futures(page: int = 100) -> list[dict]:
 def cde_perps() -> dict[str, dict]:
     """标的 -> 该标的的 CDE 永续。一个公开请求拿全部。
 
-    CDE 的「永续」在接口里 contract_expiry_type 是 EXPIRING（到期日设在
-    2030 年），和月度交割合约的区别是有 funding_interval。
+    CDE 的「永续」在接口里 contract_expiry_type 是 EXPIRING，和月度交割合约的区别是有
+    funding_interval。到期日看 future_product_details.contract_expiry（2026-10-09 实测
+    2089-12-30）—— 别从 ticker 的「-20DEC30-」推，那个片段不是到期日；这里原来写死成
+    「2030 年」，已经误导过一次成本摊销的估算。
     """
     out: dict[str, dict] = {}
     for p in _all_futures():
