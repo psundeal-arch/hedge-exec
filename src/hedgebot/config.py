@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +48,7 @@ class Config:
     blind_after: int = 3
     resend_hours: tuple[float, ...] = (1, 3, 6, 12, 24)
     venues: tuple[str, ...] = ("kraken", "robinhood", "coinbase")   # 本机应该读得到的场所
+    unstake_targets: dict = field(default_factory=dict)   # RH 解押提醒：币 -> 可卖数量达到多少就通知
     live: Live = Live()
 
 
@@ -79,6 +80,7 @@ def load_config(path: Path | None = None) -> Config:
         blind_after=int(watch.get("blind_after", 3)),
         resend_hours=tuple(float(x) for x in watch.get("resend_hours", (1, 3, 6, 12, 24))),
         venues=tuple(str(v).lower() for v in watch.get("venues", ("kraken", "robinhood", "coinbase"))),
+        unstake_targets={str(k).upper(): float(v) for k, v in watch.get("unstake_targets", {}).items()},
         live=Live(**{k: tuple(float(x) for x in v) if isinstance(v, list) else float(v)
                      for k, v in raw.get("live", {}).items()}),
     )

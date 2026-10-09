@@ -147,8 +147,48 @@ def run(cfg: Config, *, dry_run: bool = False, now: dt.datetime | None = None) -
         log.append(f"对齐检查：{len(rows)} 个标的，{len(bad)} 个有问题")
         scope = None
 
+    # Robinhood 解押提醒：和对齐检查互不影响（各自取数、各自 scope）
+    if cfg.unstake_targets:
+        import os
+        from . import robinhood
+        rk, rs = os.environ.get("RH_API_KEY"), os.environ.get("RH_PRIVATE_KEY")
+        try:
+            if not (rk and rs):
+                raise SourceError("没有 RH_API_KEY / RH_PRIVATE_KEY")
+            av = robinhood.holdings(rk, rs, available=True)
+            for sym, need in cfg.unstake_targets.items():
+                have = av.get(sym, 0.0)
+                log.append(f"RH {sym} 可卖 {have:g} / 等 {need:g}")
+                if have >= need - 1e-9:
+                    current[f"unstake:{sym}"] = (
+                        f"Robinhood 上 {sym} 现在可卖 {have:g}（≥ {need:g}）—— 解押到账了。\n"
+                        f"平对冲腿（先预检，再加 --go）：\n"
+                        f"hedge live close {sym} --spot robinhood --perp cde --contracts N\n"
+                        f"做完后把 config.toml [watch] unstake_targets 里的 {sym} 删掉，提醒就停", 1)
+            scope = None if scope is None else scope | {"unstake"}
+        except SourceError as e:
+            log.append(f"RH 解押提醒取数失败：{e}")
+            # 这轮没读到：已发过的提醒原样保留（不当成「条件消失」清掉，否则下轮又按新的重发）
+            for k, rec in st.alerts().items():
+                if k.startswith("unstake:"):
+                    current[k] = (rec["detail"], 1)
+
     titles = {"new": "⚠ 两腿没对齐", "resend": "⚠ 仍未对齐", "recover": "✓ 已恢复"}
     for a in plan(current, scope, st.alerts(), cfg, now):
+        if a.key.startswith("unstake:"):
+            if a.kind == "recover":                   # 条件消失（已卖掉或配置删了）：静默清掉，不发「已恢复」
+                if not dry_run:
+                    st.drop(a.key)
+                continue
+            title = f"[hedge-bot] 🔔 RH 解押到账：{a.key.split(':', 1)[1]}"
+            if dry_run:
+                log.append(f"[dry-run] 会发 {title}\n{a.message}")
+                continue
+            ok, fails = notify.send(title, a.message, a.priority)
+            if ok:
+                st.mark_sent(a.key, a.message.split("\n")[0], now)
+            log.append(("已发 " if ok else "✗ 没发出去 ") + title)
+            continue
         what = {"blind": "监控看不见", "config": "凭据缺失"}.get(a.key) or a.key.split(":", 1)[1]
         head = titles[a.kind] if a.key.startswith("misalign:") else {"new": "⚠", "resend": "⚠ 仍然", "recover": "✓ 已恢复"}[a.kind]
         title = f"[hedge-bot] {head}：{what}" if a.key.startswith("misalign:") else f"[hedge-bot] {head} {what}"

@@ -146,3 +146,50 @@ def test_unexpected_venue_missing_is_only_a_note(monkeypatch):
     rows, notes, errors = account.hedge_table({}, expected=("coinbase",))
     assert [e for e in errors if "COINBASE" in e] and not [e for e in errors if "KRAKEN" in e or "RH_" in e]
     assert any("kraken" in n for n in notes) and any("robinhood" in n for n in notes)
+
+
+# --- RH 解押提醒 ----------------------------------------------------------------------
+
+def _unstake_env(tmp_path, monkeypatch, avail):
+    from hedgebot import robinhood
+    watch, c, sent = _run_env(tmp_path, monkeypatch, lambda perps, expected=None: ([], [], []))
+    c = c.__class__(**{**c.__dict__, "unstake_targets": {"ETH": 4.5}})
+    monkeypatch.setenv("RH_API_KEY", "k")
+    monkeypatch.setenv("RH_PRIVATE_KEY", "s")
+    calls = []
+
+    def holdings(k, s, available=False):
+        calls.append(available)
+        v = avail()
+        if isinstance(v, Exception):
+            raise v
+        return {"ETH": v}
+    monkeypatch.setattr(robinhood, "holdings", holdings)
+    return watch, c, sent, calls
+
+
+def test_unstake_reminder_fires_when_sellable(tmp_path, monkeypatch):
+    state = {"v": 0.0}
+    watch, c, sent, calls = _unstake_env(tmp_path, monkeypatch, lambda: state["v"])
+    watch.run(c, now=NOW)
+    assert not sent and calls == [True], "查的必须是【可卖】数量，不是总量"
+    state["v"] = 4.5
+    watch.run(c, now=NOW + dt.timedelta(minutes=15))
+    assert any("解押到账" in t and "ETH" in t and p == 1 for t, p in sent), sent
+    n = len(sent)
+    watch.run(c, now=NOW + dt.timedelta(minutes=30))
+    assert len(sent) == n, "按退避重发，不是每轮都响"
+
+
+def test_unstake_reminder_survives_fetch_failure(tmp_path, monkeypatch):
+    from hedgebot.http import SourceError
+    state = {"v": 4.5}
+    watch, c, sent, calls = _unstake_env(tmp_path, monkeypatch, lambda: state["v"])
+    watch.run(c, now=NOW)
+    assert len(sent) == 1
+    state["v"] = SourceError("RH 502")
+    watch.run(c, now=NOW + dt.timedelta(minutes=15))
+    state["v"] = 4.5
+    watch.run(c, now=NOW + dt.timedelta(minutes=30))
+    assert len(sent) == 1, "取数抖一下不该把已发的提醒清掉、再当新的重发"
+    assert not any("已恢复" in t for t, _ in sent)
