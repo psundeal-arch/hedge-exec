@@ -160,6 +160,39 @@ def leftover_orders(spot, warns: list) -> list[str]:
             for o in left]
 
 
+def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: float,
+                note: str, register: bool, ttl_s: float = 1800.0) -> tuple[str | None, str]:
+    """问 perp-track 的保证金闸门：这一单下完，账户保证金率（App 口径）会在哪。
+
+    和「CDE 购买力」检查是【叠加】不是替换：购买力答「这一单下得了吗」，闸门答
+    「下完之后离 60% 传呼线还有多远」—— 购买力可以很充裕而比值已越线（网格据此停开新格）。
+
+    register=True 时放行会登记一条动仓意图，margin-watch 的速率规则在 TTL 内不判 —— 只在
+    真要下单时传（--go / exec worker），只看不下单别登记，否则白白压掉速率判定。
+    注意：登记写进本机仓库根的 perp.db；只有在服务器上跑（exec worker）才是 margin-watch
+    读的那个活库，本机 hedge live 的登记到不了服务器。
+
+    返回 (阻断原因或 None, 一行说明)。【取数失败一律拦】（fail-closed）。"""
+    try:
+        from perptrack import config as pt_config
+        from perptrack import gate
+        from perptrack.store import Store
+        pcfg = pt_config.load_config()
+        if register:
+            with Store() as st:
+                g = gate.check(pcfg, add_notional=add_notional, margin_rate=margin_rate,
+                               spend_cash=spend_cash, source="hedge-bot", note=note,
+                               ttl_s=ttl_s, store=st)
+        else:
+            g = gate.check(pcfg, add_notional=add_notional, margin_rate=margin_rate,
+                           spend_cash=spend_cash, source="hedge-bot", note=note)
+    except Exception as e:                                    # noqa: BLE001 —— 闸门坏了就不放行
+        return f"保证金闸门出错，不放行：{type(e).__name__}: {e}", ""
+    info = (f"保证金率（App 口径）{g.ratio_now:.1%} → 成交后 {g.ratio_after:.1%}，线 {g.limit:.0%}"
+            if g.ratio_now is not None and g.ratio_after is not None else "")
+    return (None if g.ok else g.reason), info
+
+
 def fixed_fee_bp(cfg: Config, per_contract_usd: float) -> float:
     """CDE 每张固定费折成 bp/边。按张收、和名义无关，所以合约越小越贵。"""
     return cfg.fees.cde_per_contract / per_contract_usd * 1e4 if per_contract_usd > 0 else float("inf")
@@ -283,6 +316,14 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
                                  f"追加保证金 —— 看 perp-track 的强平距离")
             except SourceError as e:
                 blockers.append(f"读不到 CDE 保证金：{e}")
+            # 叠加 perp-track 的比值闸门（App 口径）：购买力够不等于离传呼线还远
+            why, info = margin_gate(add_notional=notional, margin_rate=p["margin_short_overnight"],
+                                    spend_cash=notional if args.spot == "coinbase" else 0.0,
+                                    note=f"hedge live open {sym} {contracts} 张", register=need_trade)
+            if info:
+                warns.append(info)
+            if why:
+                blockers.append(why)
 
         if args.action == "close":
             try:
@@ -370,6 +411,15 @@ def perp_only(cfg: Config, args) -> None:
         blockers.append(f"名义 ${notional:,.0f} 超过上限 ${cfg.live.max_notional_usd:,.0f}")
     if args.action == "open" and ref and (why := fixed_fee_blocker(cfg, cs * ref)):
         _fixed_fee(args, why, blockers, warns)
+    if args.action == "open":
+        # 裸空的保证金占用是纯增量（没有现货抵消）—— 原来这条路径一点保证金检查都没有
+        why, info = margin_gate(add_notional=notional, margin_rate=p["margin_short_overnight"],
+                                spend_cash=0.0, note=f"hedge live --perp-only open {sym} {n} 张",
+                                register=bool(args.go))
+        if info:
+            warns.append(info)
+        if why:
+            blockers.append(why)
     if args.action == "close":
         try:
             held = sum(r["contracts"] for r in coinbase.positions(cb_auth.key_name, cb_auth.key_secret)

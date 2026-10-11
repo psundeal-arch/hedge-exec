@@ -189,13 +189,17 @@ class Scheduler:
     def __init__(self, job: Job, spot, perp=None, *, contract_size: float = 1.0, ref_fn: Callable,
                  store: Store | None = None, notify: Callable = lambda *a, **k: None,
                  clock=time.time, sleep=time.sleep, say=print, poll_s: float = 15.0,
-                 escalation_bps=(30.0, 100.0, 300.0)):
+                 escalation_bps=(30.0, 100.0, 300.0), gate: Callable | None = None):
         self.j, self.spot, self.perp, self.cs = job, spot, perp, contract_size
         self.ref_fn, self.store = ref_fn, store
         tag = "【模拟】" if job.mode == "paper" else "【实盘】"   # 通知必须一眼分清演练和真实成交
         self.notify = lambda t, m, p=0: notify(f"{tag}{t}", f"{tag}{m}", p)
         self.clock, self.sleep, self._say, self.poll_s = clock, sleep, say, poll_s
         self.esc = tuple(escalation_bps)
+        # 保证金闸门：gate(add_notional, spend_cash, note) -> 阻断原因或 None。每份子单【下单前】问一次
+        # —— 提交时查过不算数，时间窗是小时级的，期间网格和行情都会改变账户
+        self.gate = gate
+        self._gate_blocked: str | None = None
         self.ref = None
         self.ref_ts = 0.0
         self.stop = False
@@ -295,6 +299,21 @@ class Scheduler:
                 return "wait", 0.0, f"{'高位不追' if j.buy else '低位不砸'}：偏离 VWAP {dev:+.2f} 个 ATR"
             return "go", sl, "按进度" + ("（很急）" if urgent else "")
         return "wait", 0.0, "进度已到"
+
+    def _gate(self, q: float) -> str | None:
+        """这一份下完，账户保证金率会不会越线。只管会【增加】风险的：开空、在 Coinbase 买现货。"""
+        j = self.j
+        if not self.gate or j.mode != "live" or j.kind not in ("hedge_open", "spot_buy"):
+            return None
+        px = self.spot.book().mid or 0
+        if j.hedge:
+            add = int(round(q)) * self.cs * px
+            spend = add if j.venue == "coinbase" else 0.0
+        else:
+            add, spend = 0.0, (q * px if j.venue == "coinbase" else 0.0)
+            if not spend:
+                return None                          # RH / Kraken 买现货不碰 CDE 保证金
+        return self.gate(add, spend, f"hedge exec #{j.id} {j.kind} {j.symbol} {q:g}")
 
     # ------------------------------------------------------------ 子单
     def _ladder(self, n: int, wait_s: float, cap: float | None = None) -> bool:
@@ -571,6 +590,17 @@ class Scheduler:
             if act == "finish":
                 self.finish()
                 break
+            if act == "go" and (blocked := self._gate(q)):
+                # 只在拦住的原因变了时通知（上面那行每轮会重置 state.paused，所以单独记）
+                if blocked != self._gate_blocked:
+                    self.say(f"保证金闸门拦住，暂停：{blocked}")
+                    self.notify(f"hedge exec #{j.id} {j.symbol} 暂停（保证金）", blocked, 0)
+                self._gate_blocked = j.state.paused = blocked
+                self.save()
+                self.sleep(self.poll_s)
+                continue
+            if act == "go":
+                self._gate_blocked = None
             if act == "go":
                 self.say(f"下一份 {q:g}：{why}")
                 if not self.execute(q, j.params.child_wait_s, urgent="很急" in why):

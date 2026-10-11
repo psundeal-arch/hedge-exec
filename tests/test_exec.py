@@ -593,3 +593,42 @@ def test_child_residual_is_reported_not_hidden():
     assert abs(left) > 0.001, "这个场景本来就会剩零头"
     assert any("未对冲零头" in t and p == 1 for t, p in sent), sent
     assert "未对冲" in sch.summary_line()
+
+
+# --- 保证金闸门 ---------------------------------------------------------------------
+
+def test_exec_child_waits_on_margin_gate_then_proceeds():
+    """每份子单下单前问闸门：拦住就暂停（只通知一次），放行后接着做 —— 不判 error。"""
+    calls = []
+
+    def gate(add, spend, note):
+        calls.append((add, spend))
+        return "成交后 62% 越过 60%" if len(calls) <= 2 else None
+    sch, job, spot, clk, sent = mk("hedge_open", 1.0, perp=Perp(), min_slices=1)
+    job.mode = "live"
+    sch.gate = gate
+    clk.t = T0 + 0.9 * 4 * 3600
+    sch.run()
+    assert job.status == "done" and job.state.done == 1
+    assert len(calls) == 3 and calls[0][0] == pytest.approx(1 * 1.0 * 100.01), "按这一份的名义问"
+    assert calls[0][1] == pytest.approx(calls[0][0]), "Coinbase 现货：花掉的现金也要传"
+    assert sum("保证金" in t for t, _ in sent) == 1, f"暂停只通知一次：{sent}"
+
+
+def test_gate_skipped_for_paper_and_non_coinbase_spot_buy():
+    asked = []
+    for kind, venue, mode in (("hedge_open", "coinbase", "paper"), ("spot_buy", "robinhood", "live")):
+        sch, job, spot, clk, sent = mk(kind, 1.0, perp=Perp() if kind == "hedge_open" else None)
+        job.venue, job.mode = venue, mode
+        sch.gate = lambda a, s, n: asked.append(n) or "拦"
+        assert sch._gate(1.0) is None
+    assert not asked
+
+
+def test_margin_gate_fails_closed(monkeypatch):
+    """闸门自己出错（取不到保证金、配置坏了）→ 不放行。"""
+    from hedgebot import live
+    import perptrack.gate as g
+    monkeypatch.setattr(g, "check", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("CFM 502")))
+    why, _ = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=False)
+    assert why and "不放行" in why

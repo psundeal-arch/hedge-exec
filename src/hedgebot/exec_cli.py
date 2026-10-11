@@ -84,6 +84,15 @@ def submit(cfg: Config, args) -> None:
                     blockers.append(f"{args.venue} 可卖 {sym} {bal.get(sym, 0):g} < {qty:g}")
             except Exception as e:                    # noqa: BLE001
                 blockers.append(f"读不到 {args.venue} 余额：{e}")
+        if not dry and kind == "spot_buy" and args.venue == "coinbase":
+            # Coinbase 买现货花掉的现金直接离开保证金分母 —— 原来只查 USD 余额，不看比值
+            from .live import margin_gate
+            why, info = margin_gate(add_notional=0.0, margin_rate=0.0, spend_cash=notional,
+                                    note=f"hedge exec buy {sym} 提交预检", register=False)
+            if info:
+                print(f"  · {info}")
+            if why:
+                blockers.append(why)
         print(f"{'买入' if kind == 'spot_buy' else '卖出'} {sym} 现货 {qty:g}（≈ ${notional:,.0f}）在 {args.venue}，现价 {mid:g}")
         for n in notes:
             print(f"  · {n}")
@@ -237,11 +246,18 @@ def worker(cfg: Config, args) -> None:
                 print(f"[#{job.id}] 启动失败，已置 error：{e}", flush=True)
                 continue
             perp_pid = p["product_id"] if job.hedge else None
+            rate = p.get("margin_short_overnight")
+
+            def gate_fn(add, spend, note, rate=rate):
+                from .live import margin_gate
+                why, _ = margin_gate(add_notional=add, margin_rate=rate, spend_cash=spend, note=note,
+                                     register=True, ttl_s=900)    # 子单最多几分钟；登记在服务器活库里
+                return why
             sched = Scheduler(job, spot, perp if job.hedge else None, contract_size=p["contract_size"],
                               ref_fn=lambda: exec_signal.reference(f"{job.symbol}-USD", perp_pid),
                               store=st, notify=lambda t, m, pr=0: send(t, m, pr),
                               say=lambda m: print(f"[#{job.id}] {m}", flush=True),
-                              escalation_bps=cfg.live.hedge_escalation_bps)
+                              escalation_bps=cfg.live.hedge_escalation_bps, gate=gate_fn)
             stop["sched"] = sched
             if stop["flag"]:
                 # H5：SIGTERM 落在 build() 期间时 stop["sched"] 还是 None，_term 只设了标志，
