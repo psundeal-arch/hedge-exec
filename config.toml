@@ -48,7 +48,9 @@ default_usd = 5000
 #   没开空单（PAXG、DOGE）→ 显示「有意持有」
 #   开了空单（BTC）→ 对冲部分照常检查，多出的现货不标红、不给调整建议；
 #   但空单反而多于现货（净空）仍然标红 —— 那不是「持有」能解释的
-hold_only = ["PAXG", "DOGE", "BTC", "ETH"]
+# DOT / SOL：RH 上的现货属于 perp-grid 的现货择时实盘（perp-grid-spot，2026-10-11 起），不对冲、不动 ——
+# hedge-bot 若要在 RH 动 DOT/SOL 或大笔用掉 RH 现金，先告诉 perp-grid（crypto）会话，否则它的每日对账会报警
+hold_only = ["PAXG", "DOGE", "BTC", "ETH", "DOT", "SOL"]
 # CDE 永续由 perp-grid 实盘网格独立交易（2026-10-03 起 SUI；10-04 加 XRP，服务器上已先改）：仓位不和现货对齐、watch 不报警。
 # 这些标的不要再用 hedge live 开对冲空单 —— 会和网格的仓位混在一起。
 grid_only = ["SUI", "XRP", "ADA"]
