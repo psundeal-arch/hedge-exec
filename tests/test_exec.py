@@ -632,3 +632,15 @@ def test_margin_gate_fails_closed(monkeypatch):
     monkeypatch.setattr(g, "check", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("CFM 502")))
     why, _ = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=False)
     assert why and "不放行" in why
+
+
+def test_margin_gate_surfaces_intent_forward_failure(monkeypatch):
+    """放行但登记没转发到采集机：不拦单，但那句 ⚠ 要出现在说明里，不能被吞掉。"""
+    import types
+    from hedgebot import live
+    import perptrack.gate as g
+    monkeypatch.setattr(g, "check", lambda *a, **k: types.SimpleNamespace(
+        ok=True, ratio_now=0.45, ratio_after=0.47, limit=0.60,
+        reason="⚠ 动仓登记没能写到采集机（rhserver）：ssh 超时。单子照放\n放行：成交后 47.00%"))
+    why, info = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=False)
+    assert why is None and "⚠ 动仓登记没能写到采集机" in info

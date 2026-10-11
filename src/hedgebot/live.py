@@ -190,6 +190,9 @@ def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: f
         return f"保证金闸门出错，不放行：{type(e).__name__}: {e}", ""
     info = (f"保证金率（App 口径）{g.ratio_now:.1%} → 成交后 {g.ratio_after:.1%}，线 {g.limit:.0%}"
             if g.ratio_now is not None and g.ratio_after is not None else "")
+    if g.ok and (g.reason or "").startswith("⚠"):
+        # 放行但动仓登记没写到采集机（ssh 转发失败）：单子照放，可能会有一次误传呼 —— 要让人看见
+        info = (info + "；" if info else "") + g.reason.split("\n")[0]
     return (None if g.ok else g.reason), info
 
 
