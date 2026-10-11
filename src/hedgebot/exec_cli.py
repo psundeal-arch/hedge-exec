@@ -246,12 +246,13 @@ def worker(cfg: Config, args) -> None:
                 print(f"[#{job.id}] 启动失败，已置 error：{e}", flush=True)
                 continue
             perp_pid = p["product_id"] if job.hedge else None
-            rate = p.get("margin_short_overnight")
+            rate, pid = p.get("margin_short_overnight"), p.get("product_id", "")
 
-            def gate_fn(add, spend, note, rate=rate):
+            def gate_fn(add, spend, note, n=0, rate=rate, pid=pid):
                 from .live import margin_gate
                 why, _ = margin_gate(add_notional=add, margin_rate=rate, spend_cash=spend, note=note,
-                                     register=True, ttl_s=900)    # 子单最多几分钟；登记在服务器活库里
+                                     register=True, ttl_s=900,     # 子单最多几分钟；登记在服务器活库里
+                                     product_id=pid if n else "", contracts=n)
                 return why
             sched = Scheduler(job, spot, perp if job.hedge else None, contract_size=p["contract_size"],
                               ref_fn=lambda: exec_signal.reference(f"{job.symbol}-USD", perp_pid),

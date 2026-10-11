@@ -196,7 +196,7 @@ class Scheduler:
         self.notify = lambda t, m, p=0: notify(f"{tag}{t}", f"{tag}{m}", p)
         self.clock, self.sleep, self._say, self.poll_s = clock, sleep, say, poll_s
         self.esc = tuple(escalation_bps)
-        # 保证金闸门：gate(add_notional, spend_cash, note) -> 阻断原因或 None。每份子单【下单前】问一次
+        # 保证金闸门：gate(add_notional, spend_cash, note, contracts) -> 阻断原因或 None。每份子单【下单前】问一次
         # —— 提交时查过不算数，时间窗是小时级的，期间网格和行情都会改变账户
         self.gate = gate
         self._gate_blocked: str | None = None
@@ -306,14 +306,15 @@ class Scheduler:
         if not self.gate or j.mode != "live" or j.kind not in ("hedge_open", "spot_buy"):
             return None
         px = self.spot.book().mid or 0
+        n = int(round(q)) if j.hedge else 0
         if j.hedge:
-            add = int(round(q)) * self.cs * px
+            add = n * self.cs * px
             spend = add if j.venue == "coinbase" else 0.0
         else:
             add, spend = 0.0, (q * px if j.venue == "coinbase" else 0.0)
             if not spend:
                 return None                          # RH / Kraken 买现货不碰 CDE 保证金
-        return self.gate(add, spend, f"hedge exec #{j.id} {j.kind} {j.symbol} {q:g}")
+        return self.gate(add, spend, f"hedge exec #{j.id} {j.kind} {j.symbol} {q:g}", n)
 
     # ------------------------------------------------------------ 子单
     def _ladder(self, n: int, wait_s: float, cap: float | None = None) -> bool:

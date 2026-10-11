@@ -161,7 +161,8 @@ def leftover_orders(spot, warns: list) -> list[str]:
 
 
 def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: float,
-                note: str, register: bool, ttl_s: float = 1800.0) -> tuple[str | None, str]:
+                note: str, register: bool, ttl_s: float = 1800.0,
+                product_id: str = "", contracts: int = 0) -> tuple[str | None, str]:
     """问 perp-track 的保证金闸门：这一单下完，账户保证金率（App 口径）会在哪。
 
     和「CDE 购买力」检查是【叠加】不是替换：购买力答「这一单下得了吗」，闸门答
@@ -172,20 +173,24 @@ def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: f
     注意：登记写进本机仓库根的 perp.db；只有在服务器上跑（exec worker）才是 margin-watch
     读的那个活库，本机 hedge live 的登记到不了服务器。
 
+    给了 product_id + contracts 就让闸门用 Coinbase 自己 orders/preview 的 projected_margin_ratio
+    （比手算折算准：11 张 HEP 手算 55.5%、CB 57.2%）；spend_cash 照传 —— preview 不知道要花现金买现货。
+
     返回 (阻断原因或 None, 一行说明)。【取数失败一律拦】（fail-closed）。"""
     try:
         from perptrack import config as pt_config
         from perptrack import gate
         from perptrack.store import Store
         pcfg = pt_config.load_config()
+        kw = dict(add_notional=add_notional, margin_rate=margin_rate, spend_cash=spend_cash,
+                  source="hedge-bot", note=note, ttl_s=ttl_s)
+        if product_id and contracts > 0:
+            kw |= dict(product_id=product_id, base_size=str(int(contracts)), side="SELL")
         if register:
             with Store() as st:
-                g = gate.check(pcfg, add_notional=add_notional, margin_rate=margin_rate,
-                               spend_cash=spend_cash, source="hedge-bot", note=note,
-                               ttl_s=ttl_s, store=st)
+                g = gate.check(pcfg, store=st, **kw)
         else:
-            g = gate.check(pcfg, add_notional=add_notional, margin_rate=margin_rate,
-                           spend_cash=spend_cash, source="hedge-bot", note=note)
+            g = gate.check(pcfg, **kw)
     except Exception as e:                                    # noqa: BLE001 —— 闸门坏了就不放行
         return f"保证金闸门出错，不放行：{type(e).__name__}: {e}", ""
     info = (f"保证金率（App 口径）{g.ratio_now:.1%} → 成交后 {g.ratio_after:.1%}，线 {g.limit:.0%}"
@@ -322,7 +327,8 @@ def preflight(cfg: Config, args, *, need_trade: bool) -> dict:
             # 叠加 perp-track 的比值闸门（App 口径）：购买力够不等于离传呼线还远
             why, info = margin_gate(add_notional=notional, margin_rate=p["margin_short_overnight"],
                                     spend_cash=notional if args.spot == "coinbase" else 0.0,
-                                    note=f"hedge live open {sym} {contracts} 张", register=need_trade)
+                                    note=f"hedge live open {sym} {contracts} 张", register=need_trade,
+                                    product_id=p["product_id"], contracts=contracts)
             if info:
                 warns.append(info)
             if why:
@@ -418,7 +424,7 @@ def perp_only(cfg: Config, args) -> None:
         # 裸空的保证金占用是纯增量（没有现货抵消）—— 原来这条路径一点保证金检查都没有
         why, info = margin_gate(add_notional=notional, margin_rate=p["margin_short_overnight"],
                                 spend_cash=0.0, note=f"hedge live --perp-only open {sym} {n} 张",
-                                register=bool(args.go))
+                                register=bool(args.go), product_id=p["product_id"], contracts=n)
         if info:
             warns.append(info)
         if why:

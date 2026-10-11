@@ -601,8 +601,8 @@ def test_exec_child_waits_on_margin_gate_then_proceeds():
     """每份子单下单前问闸门：拦住就暂停（只通知一次），放行后接着做 —— 不判 error。"""
     calls = []
 
-    def gate(add, spend, note):
-        calls.append((add, spend))
+    def gate(add, spend, note, n=0):
+        calls.append((add, spend, n))
         return "成交后 62% 越过 60%" if len(calls) <= 2 else None
     sch, job, spot, clk, sent = mk("hedge_open", 1.0, perp=Perp(), min_slices=1)
     job.mode = "live"
@@ -612,6 +612,7 @@ def test_exec_child_waits_on_margin_gate_then_proceeds():
     assert job.status == "done" and job.state.done == 1
     assert len(calls) == 3 and calls[0][0] == pytest.approx(1 * 1.0 * 100.01), "按这一份的名义问"
     assert calls[0][1] == pytest.approx(calls[0][0]), "Coinbase 现货：花掉的现金也要传"
+    assert calls[0][2] == 1, "张数要传，闸门才能用 Coinbase 自己的 projected_margin_ratio"
     assert sum("保证金" in t for t, _ in sent) == 1, f"暂停只通知一次：{sent}"
 
 
@@ -620,7 +621,7 @@ def test_gate_skipped_for_paper_and_non_coinbase_spot_buy():
     for kind, venue, mode in (("hedge_open", "coinbase", "paper"), ("spot_buy", "robinhood", "live")):
         sch, job, spot, clk, sent = mk(kind, 1.0, perp=Perp() if kind == "hedge_open" else None)
         job.venue, job.mode = venue, mode
-        sch.gate = lambda a, s, n: asked.append(n) or "拦"
+        sch.gate = lambda a, s, note, n=0: asked.append(note) or "拦"
         assert sch._gate(1.0) is None
     assert not asked
 
@@ -644,3 +645,19 @@ def test_margin_gate_surfaces_intent_forward_failure(monkeypatch):
         reason="⚠ 动仓登记没能写到采集机（rhserver）：ssh 超时。单子照放\n放行：成交后 47.00%"))
     why, info = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=False)
     assert why is None and "⚠ 动仓登记没能写到采集机" in info
+
+
+def test_margin_gate_passes_contract_for_cb_projection(monkeypatch):
+    """有合约和张数就交给闸门用 Coinbase 的 projected_margin_ratio；Coinbase 买现货（0 张）不传。"""
+    import types
+    from hedgebot import live
+    import perptrack.gate as g
+    seen = []
+    monkeypatch.setattr(g, "check", lambda cfg, **k: seen.append(k) or types.SimpleNamespace(
+        ok=True, ratio_now=0.45, ratio_after=0.47, limit=0.6, reason="放行"))
+    live.margin_gate(add_notional=5000, margin_rate=0.6, spend_cash=5000, note="t", register=False,
+                     product_id="HEP-20DEC30-CDE", contracts=11)
+    live.margin_gate(add_notional=0, margin_rate=0, spend_cash=100, note="t", register=False)
+    assert seen[0]["product_id"] == "HEP-20DEC30-CDE" and seen[0]["base_size"] == "11" and seen[0]["side"] == "SELL"
+    assert seen[0]["spend_cash"] == 5000, "preview 不知道买现货要花现金，spend_cash 照传"
+    assert "product_id" not in seen[1]
