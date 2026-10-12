@@ -162,14 +162,23 @@ def leftover_orders(spot, warns: list) -> list[str]:
 
 
 def perp_track_bin() -> str:
-    """perp-track 命令的位置：环境变量 PERP_TRACK_BIN > 与本 Python 同目录 > PATH。
-    拆仓后 perp-track 在自己的 venv 里，用 PERP_TRACK_BIN 指过去。"""
+    """perp-track 命令的位置。依次：PERP_TRACK_BIN 环境变量 > 与本 Python 同目录 >
+    本机 perp-track 仓的 venv（PERP_TRACK_HOME，默认 ~/git/perp-track）> 服务器部署目录
+    ~/perp-track 的 venv > PATH。
+
+    拆仓后 hedge-bot 的 venv 里没有 perp-track；只靠 PATH 的话本机 hedge live 找不到它，
+    闸门「出错不放行」—— 等于所有开仓都被拦（10-12 拆仓当天发现）。"""
     import shutil
     import sys
     if os.environ.get("PERP_TRACK_BIN"):
         return os.environ["PERP_TRACK_BIN"]
-    sib = Path(sys.executable).with_name("perp-track")
-    return str(sib) if sib.exists() else (shutil.which("perp-track") or "perp-track")
+    home = Path(os.environ.get("PERP_TRACK_HOME") or Path.home() / "git" / "perp-track")
+    for c in (Path(sys.executable).with_name("perp-track"),
+              home / ".venv" / "bin" / "perp-track",
+              Path.home() / "perp-track" / ".venv" / "bin" / "perp-track"):
+        if c.exists():
+            return str(c)
+    return shutil.which("perp-track") or "perp-track"
 
 
 def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: float,

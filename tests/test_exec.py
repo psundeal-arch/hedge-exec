@@ -692,3 +692,17 @@ def test_margin_gate_cli_args(monkeypatch):
     assert "--no-intent" in a and "--no-intent" not in b
     assert "--margin-rate" not in b and "None" not in b
     assert "--product-id" not in b
+
+
+def test_perp_track_bin_finds_sibling_repo_venv(tmp_path, monkeypatch):
+    """拆仓后 hedge 的 venv 里没有 perp-track：要能找到 perp-track 仓自己的 venv，
+    否则本机闸门一律「出错不放行」。"""
+    from hedgebot import live
+    monkeypatch.delenv("PERP_TRACK_BIN", raising=False)
+    exe = tmp_path / "perp-track" / ".venv" / "bin" / "perp-track"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("PERP_TRACK_HOME", str(tmp_path / "perp-track"))
+    assert live.perp_track_bin() == str(exe)
+    monkeypatch.setenv("PERP_TRACK_BIN", "/x/perp-track")
+    assert live.perp_track_bin() == "/x/perp-track", "环境变量优先"
