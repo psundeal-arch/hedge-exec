@@ -11,7 +11,7 @@
 
 **perp-track 是另一个仓**（2026-10-02 并入、2026-10-11 拆开，各自带历史）：保证金 / 资金费监控、日报、保证金闸门都在那边，
 服务器上部署在 `~/perp-track`。本仓只经子进程用它：开仓前跑 `perp-track gate`（位置由 `PERP_TRACK_BIN` 指定），
-`scan --perp-track` / `funding` 读它的 `perp-track.toml` / `perp.db`（本机位置由 `PERP_TRACK_HOME` 指定）。
+`scan --perp-track` / `funding` 读它的 `perp-track.toml` / `perp.db`（本机位置由 `PERP_TRACK_HOME` 指定，默认 `~/git/perp-track`）。
 反过来 perp-track 经 `hedge grid-only --json` 读本仓的网格名单。
 代码注释里「审查 C1 / H2 / M18…」这类编号出自 2026-10-05 的代码审查，见 [docs/code-review.md](docs/code-review.md)（H8、H11 等 perp-track 的条目已在那边修掉）。
 

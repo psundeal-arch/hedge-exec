@@ -110,9 +110,9 @@ def cmd_account(cfg, args) -> None:
 
 # ----------------------------------------------------------------- scan
 # perp-track 是另一个仓（2026-10-11 拆开）：scan --perp-track 读它的 perp-track.toml，
-# scan / funding 读它的 perp.db。本机位置用 PERP_TRACK_HOME 指（默认 ~/git/hedge-bot ——
-# 拆仓时 perp-track 留在了原目录）；服务器上是 ~/perp-track
-PERP_TRACK = Path(os.environ.get("PERP_TRACK_HOME") or Path.home() / "git" / "hedge-bot")
+# scan / funding 读它的 perp.db。本机位置用 PERP_TRACK_HOME 指（默认 ~/git/perp-track；
+# 2026-10-12 前那个目录叫 ~/git/hedge-bot）；服务器上是 ~/perp-track
+PERP_TRACK = Path(os.environ.get("PERP_TRACK_HOME") or Path.home() / "git" / "perp-track")
 
 
 def cmd_scan(cfg, args) -> None:
