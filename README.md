@@ -9,7 +9,11 @@
 
 现货腿可以分散在 Coinbase、Kraken（可质押）和 Robinhood，`account` 会把它们加总后与 CDE 空单对齐。
 
-**perp-track 已并入本仓库**（2026-10-02，保留完整历史）：代码在 `src/perptrack/`，配置 `perp-track.toml`，说明见 [docs/perp-track.md](docs/perp-track.md)。两者仍是各自独立的进程。
+**perp-track 是另一个仓**（2026-10-02 并入、2026-10-11 拆开，各自带历史）：保证金 / 资金费监控、日报、保证金闸门都在那边，
+服务器上部署在 `~/perp-track`。本仓只经子进程用它：开仓前跑 `perp-track gate`（位置由 `PERP_TRACK_BIN` 指定），
+`scan --perp-track` / `funding` 读它的 `perp-track.toml` / `perp.db`（本机位置由 `PERP_TRACK_HOME` 指定）。
+反过来 perp-track 经 `hedge grid-only --json` 读本仓的网格名单。
+代码注释里「审查 C1 / H2 / M18…」这类编号出自 2026-10-05 的代码审查，见 [docs/code-review.md](docs/code-review.md)（H8、H11 等 perp-track 的条目已在那边修掉）。
 
 **hedge exec**（2026-10-05）：日内执行算法 —— 你定量，程序在时间窗内挑时机分批做完对冲加减仓或现货买卖，见 [docs/exec.md](docs/exec.md)。
 
@@ -87,7 +91,7 @@ CDE 手续费 = 比例费 + 每张固定费（2026-10-01 用 91 笔真实 maker 
   持续存在按 1h/3h/6h/12h/24h 退避重发，消失时发一条恢复通知。
 - **取数有任何一边失败 → 本轮不评估对齐**。否则 Robinhood 一抖，现货读成 0，就是一条假的
   「裸空」报警。已有的报警记录原样保留，连续 3 轮（45 分钟）失败才报「监控看不见」。
-- **进程本身崩溃** → `hedge-bot-failed@<单元>.service` 用裸 curl 发 Pushover，文案和节流按单元分开，每个单元 6 小时内最多一次（watch、exec、perp-track 日报都接了）。
+- **进程本身崩溃** → `hedge-bot-failed@<单元>.service` 用裸 curl 发 Pushover，文案和节流按单元分开，每个单元 6 小时内最多一次（watch、exec 都接了）。
 - 凭据在服务器 `~/vault`（2026-10-06 集中，目录 700、文件 600）：单元按需挂 `coinbase-view` /
   `kraken-view` / `robinhood-view` / `notify`，部署不推送任何凭据，只校验（见 `deploy/deploy.sh`）。
   本机照旧用仓库根的 `.env`（模板 `.env.example`）。报警状态在 `data/watch.db`。

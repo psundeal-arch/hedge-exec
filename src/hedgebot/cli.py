@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 
@@ -108,8 +109,10 @@ def cmd_account(cfg, args) -> None:
 
 
 # ----------------------------------------------------------------- scan
-# perp-track 已并入本仓库：配置 perp-track.toml、数据库 perp.db 都在仓库根目录
-from .config import PROJECT_ROOT as PERP_TRACK
+# perp-track 是另一个仓（2026-10-11 拆开）：scan --perp-track 读它的 perp-track.toml，
+# scan / funding 读它的 perp.db。本机位置用 PERP_TRACK_HOME 指（默认 ~/git/hedge-bot ——
+# 拆仓时 perp-track 留在了原目录）；服务器上是 ~/perp-track
+PERP_TRACK = Path(os.environ.get("PERP_TRACK_HOME") or Path.home() / "git" / "hedge-bot")
 
 
 def cmd_scan(cfg, args) -> None:
@@ -214,7 +217,7 @@ def cmd_funding(cfg, args) -> None:
     if db is None and args.server:
         cache = cfg.db_path.parent / "perp-server.db"
         r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                            f"{args.server}:hedge-bot/perp.db", str(cache)],
+                            f"{args.server}:perp-track/perp.db", str(cache)],
                            capture_output=True, text=True)
         if r.returncode == 0:
             db, src = cache, f"{args.server}（刚拉取）"

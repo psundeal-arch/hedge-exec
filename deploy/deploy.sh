@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
-# 部署 hedge-bot（含并入的 perp-track）到服务器，装上全部 systemd user 定时任务。
+# 部署 hedge-bot 到服务器 ~/hedge-bot，装上它的 systemd user 单元。
 #
 #   ./deploy/deploy.sh [user@host] [远程目录]     默认 rhserver hedge-bot
 #
-# 进程分开、仓库合一（2026-10-02 并入）：
-#   perp-track.timer          日报（每天 17:00 PT）
-#   perp-track-funding.timer  全场 CDE 资金费采样（每小时 :02）
-#   perp-track-watch.timer    保证金率监控 + Pushover 传呼（每 15 分钟）
 #   hedge-bot-watch.timer     两腿对齐巡检（每 15 分钟 :05/:20/:35/:50）
 #   hedge-exec.service        日内执行 worker（常驻；交易 key 用 ~/perp-grid-live/.env.trade，不在本目录）
-# 保证金传呼是安全网，交易代码改得勤 —— 所以各自独立的进程，互不拖累。
+#   hedge-bot-failed@.service 上面两个异常退出时的独立传呼
+#
+# perp-track（保证金/资金费监控、保证金闸门）2026-10-11 拆成另一个仓，部署在 ~/perp-track，
+# 有自己的 deploy.sh。hedge-bot 只经子进程用它：保证金闸门跑 `perp-track gate`（PERP_TRACK_BIN）。
 #
 # 交易 key（.env.trade）【绝不上服务器的 hedge-bot 目录】。
 # 凭据正本在服务器 ~/vault（2026-10-06 集中，目录 700、文件 600）：部署【不推任何凭据】，
 # 只校验各单元要挂的 vault 文件在、权限对、键齐 —— 少了就停，不让单元带着缺变量起来。
-# perp.db（资金费历史、快照、告警幂等）远程已有就【绝不覆盖】。
 #
-# 三道关（审查 H3/H11）：
+# 三道关（审查 H3/H11，见 docs/code-review.md）：
 #   1. 只部署已提交的 HEAD（git archive），本机测试不过什么都不动
-#   2. 服务器上的 config.toml / perp-track.toml 被手改过 → 停下给 diff；确认覆盖用 FORCE_CONFIG=1
+#   2. 服务器上的 config.toml 被手改过 → 停下给 diff；确认覆盖用 FORCE_CONFIG=1
 #   3. 服务器上 pip + 测试 + 冒烟在 set -euo pipefail 里跑，不过就不重启 hedge-exec
 # 被覆盖/删除的文件备份在服务器 .deploy-backup/<时间>（留 10 份）；当前版本记在 .deployed/COMMIT
 set -euo pipefail
@@ -26,12 +24,10 @@ set -euo pipefail
 TARGET="${1:-rhserver}"
 REMOTE_DIR="${2:-hedge-bot}"
 LOCAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-UNITS="perp-track.service perp-track.timer perp-track-funding.service perp-track-funding.timer \
-perp-track-watch.service perp-track-watch.timer perp-track-pager-failed.service \
-hedge-bot-watch.service hedge-bot-watch.timer hedge-bot-failed@.service hedge-exec.service"
-TIMERS="perp-track.timer perp-track-funding.timer perp-track-watch.timer hedge-bot-watch.timer"
+UNITS="hedge-bot-watch.service hedge-bot-watch.timer hedge-bot-failed@.service hedge-exec.service"
+TIMERS="hedge-bot-watch.timer"
 
-CONFIGS="config.toml perp-track.toml"
+CONFIGS="config.toml"
 # 各单元挂的 vault 文件及其必须有的键（与 deploy/*.service 的 EnvironmentFile 对应）
 VAULT_NEEDS="coinbase-view.env:COINBASE_API_KEY_NAME,COINBASE_API_PRIVATE_KEY \
 kraken-view.env:KRAKEN_API_KEY,KRAKEN_API_SECRET \
@@ -89,6 +85,26 @@ if [ "$drift" = 1 ] && [ "${FORCE_CONFIG:-0}" != 1 ]; then
   exit 1
 fi
 
+# --- 拆仓守卫：perp-track 必须已经搬出 ~/hedge-bot -----------------------------------
+# 下面的 rsync --delete 会删掉 ~/hedge-bot 里不属于本仓的东西（src/perptrack 等）。perp-track 还在
+# 这里跑的话，它的定时任务下一轮就找不到代码 —— 保证金监控静默停掉。所以先确认它已在 ~/perp-track。
+echo "==> perp-track 是否已搬出 ~/$REMOTE_DIR"
+if ! ssh "$TARGET" bash -s -- "$REMOTE_DIR" <<'REMOTE'
+set -uo pipefail
+bad=0
+[ -e ~/"$1"/perp.db ] && { echo "    !! ~/$1/perp.db 还在 —— perp-track 的活库还没搬到 ~/perp-track"; bad=1; }
+if grep -lsE "%h/$1/|/$1/\.venv/bin/perp-track" ~/.config/systemd/user/perp-track*.service >/dev/null; then
+  echo "    !! 还有 perp-track 单元指向 ~/$1：$(grep -lsE "%h/$1/" ~/.config/systemd/user/perp-track*.service | xargs -n1 basename | tr '\n' ' ')"; bad=1
+fi
+[ -x ~/perp-track/.venv/bin/perp-track ] || { echo "    !! ~/perp-track/.venv/bin/perp-track 不存在 —— 保证金闸门会一律拦单"; bad=1; }
+[ $bad = 0 ] && echo "    perp-track 已在 ~/perp-track ✓"
+exit $bad
+REMOTE
+then
+  echo "!! perp-track 还没搬完 —— 什么都没动。先按拆仓步骤把它部署到 ~/perp-track"
+  exit 1
+fi
+
 echo "==> 同步代码（被覆盖/删除的文件备份到 .deploy-backup/$TS）"
 rsync -az --delete --backup --backup-dir=".deploy-backup/$TS" \
   --exclude '.git/' --exclude '.claude/' --exclude '.pytest_cache/' --exclude '.venv/' \
@@ -131,14 +147,6 @@ then
   exit 1
 fi
 
-echo "==> 数据库"
-if ssh "$TARGET" "test -f $REMOTE_DIR/perp.db"; then
-  echo "    远程已有 perp.db，保留不动"
-else
-  echo "    !! 远程没有 perp.db —— 首次部署请先迁移历史库（见 docs/perp-track.md「迁移」），"
-  echo "    !! 否则 perp-track 会从空库开始，资金费均值与告警幂等全部丢失"
-fi
-
 ROLLBACK="回滚：git checkout <上一个提交> && ./deploy/deploy.sh；被覆盖的旧文件在服务器 $REMOTE_DIR/.deploy-backup/$TS"
 
 # --- 关卡三：服务器上再测一遍 + 冒烟（H3）----------------------------------------
@@ -163,10 +171,13 @@ if ! ssh "$TARGET" bash -s -- "$REMOTE_DIR" <<'REMOTE'
 set -uo pipefail
 cd "$1"
 set -a; for f in coinbase-view kraken-view robinhood-view notify misc; do . ~/vault/$f.env; done; set +a
-out="$(.venv/bin/perp-track status 2>&1)"
-echo "$out" | grep -E '账户保证金率|能扛住' || true
-if echo "$out" | grep -q Traceback || ! echo "$out" | grep -q '账户保证金率'; then
-  echo "$out" | tail -15; echo "!! perp-track status 异常"; exit 1
+export PERP_TRACK_BIN="$HOME/perp-track/.venv/bin/perp-track"
+# 两条进程边界：perp-track 能读到 grid_only、hedge-bot 能问到保证金闸门（--no-intent，不登记）
+.venv/bin/hedge grid-only --json || { echo "!! hedge grid-only 失败"; exit 1; }
+out="$(.venv/bin/python -c "from hedgebot.live import margin_gate; print(margin_gate(add_notional=0, margin_rate=None, spend_cash=0, note='部署冒烟', register=False))" 2>&1)"
+echo "    闸门：$out"
+if echo "$out" | grep -qE "Traceback|闸门出错"; then
+  echo "!! 保证金闸门调不通"; exit 1
 fi
 out="$(.venv/bin/hedge account 2>&1)"
 echo "$out" | tail -3
@@ -209,7 +220,7 @@ ssh "$TARGET" "mkdir -p $REMOTE_DIR/.deployed && chmod 700 $REMOTE_DIR/.deployed
   echo '$COMMIT $TS' > $REMOTE_DIR/.deployed/COMMIT && \
   ls -1d $REMOTE_DIR/.deploy-backup/* 2>/dev/null | sort | head -n -10 | xargs -r rm -rf"
 echo "    服务器现在跑的是 $COMMIT（记在 $REMOTE_DIR/.deployed/COMMIT）"
-ssh "$TARGET" "systemctl --user list-timers 'perp-track*' 'hedge-bot*' --no-pager | head -6; \
+ssh "$TARGET" "systemctl --user list-timers 'hedge-bot*' --no-pager | head -4; \
   loginctl show-user \$(whoami) -p Linger"
 
 echo

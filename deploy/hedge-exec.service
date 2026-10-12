@@ -14,6 +14,8 @@ WorkingDirectory=%h/hedge-bot
 # worker 从 HEDGE_EXEC_KEYS 读，默认 ~/perp-grid-live/.env.trade（服务器 IP 绑定的 Coinbase View+Trade key）
 EnvironmentFile=%h/vault/coinbase-view.env
 EnvironmentFile=%h/vault/notify.env
+# 保证金闸门跑 perp-track 的命令（另一个仓，部署在 ~/perp-track）；找不到就一律拦单
+Environment=PERP_TRACK_BIN=%h/perp-track/.venv/bin/perp-track
 ExecStart=%h/hedge-bot/.venv/bin/hedge exec worker
 # SIGTERM 后排程器停在安全点；正在做的对冲子单（Ladder）最多几分钟，给够时间收尾。被强杀也没关系：重启后恢复流程会撤旧单、补对冲缺口
 KillSignal=SIGTERM

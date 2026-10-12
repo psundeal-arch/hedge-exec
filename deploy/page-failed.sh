@@ -15,9 +15,6 @@ case "$UNIT" in
   hedge-exec.service)
     title="hedge exec worker 失败"
     what="日内执行 worker 异常退出。可能有任务停在半路 —— 先 hedge exec status，再 hedge account 核对两腿。" ;;
-  perp-track.service)
-    title="perp-track 日报单元失败"
-    what="日报快照连续失败（已自动重试）。今天的日报和基于快照的告警可能都没有出。" ;;
   *)
     title="$UNIT 失败"
     what="单元异常退出。" ;;
