@@ -7,4 +7,4 @@ EnvironmentFile=%h/vault/notify.env
 # 裸 curl，不走项目 Python —— 单元失败的原因可能就在 Python 侧。
 # 模板实例名 = 失败的那个单元（OnFailure=hedge-bot-failed@%n.service），
 # 文案和节流标记都按单元分开（审查 H12：原来全局一个标记、文案写死 hedge watch）
-ExecStart=%h/hedge-bot/deploy/page-failed.sh %i
+ExecStart=%h/hedge-exec/deploy/page-failed.sh %i

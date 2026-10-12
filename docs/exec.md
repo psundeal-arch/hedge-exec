@@ -7,7 +7,7 @@
 ## 命令（在服务器上跑）
 
 ```
-cd ~/hedge-bot
+cd ~/hedge-exec
 .venv/bin/hedge exec open  ZEC 2 --venue coinbase --by 21:00          # 对冲加 2 张（现货买 + CDE 空），UTC 21:00 前
 .venv/bin/hedge exec close ZEC 1 --venue coinbase --by 4h             # 对冲减 1 张，4 小时内
 .venv/bin/hedge exec buy   BTC --usd 2000 --venue coinbase --by 6h    # 纯现货买

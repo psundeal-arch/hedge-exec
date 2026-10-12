@@ -4,7 +4,7 @@
 # 静音之后真正的告警也收不到了。节流按单元分开：exec 崩过一次不能压掉 watch 的传呼。
 set -u
 UNIT="${1:-unknown.service}"
-MARK="$HOME/hedge-bot/data/.failed-paged.$UNIT"
+MARK="$HOME/hedge-exec/data/.failed-paged.$UNIT"
 if [ -n "$(find "$MARK" -mmin -360 2>/dev/null)" ]; then
   exit 0
 fi

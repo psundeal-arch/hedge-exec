@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 部署 hedge-bot 到服务器 ~/hedge-bot，装上它的 systemd user 单元。
+# 部署 hedge-bot 到服务器 ~/hedge-exec（2026-10-12 前叫 ~/hedge-bot），装上它的 systemd user 单元。
 #
-#   ./deploy/deploy.sh [user@host] [远程目录]     默认 rhserver hedge-bot
+#   ./deploy/deploy.sh [user@host] [远程目录]     默认 rhserver hedge-exec
 #
 #   hedge-bot-watch.timer     两腿对齐巡检（每 15 分钟 :05/:20/:35/:50）
 #   hedge-exec.service        日内执行 worker（常驻；交易 key 用 ~/perp-grid-live/.env.trade，不在本目录）
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 TARGET="${1:-rhserver}"
-REMOTE_DIR="${2:-hedge-bot}"
+REMOTE_DIR="${2:-hedge-exec}"
 LOCAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 UNITS="hedge-bot-watch.service hedge-bot-watch.timer hedge-bot-failed@.service hedge-exec.service"
 TIMERS="hedge-bot-watch.timer"
@@ -85,8 +85,8 @@ if [ "$drift" = 1 ] && [ "${FORCE_CONFIG:-0}" != 1 ]; then
   exit 1
 fi
 
-# --- 拆仓守卫：perp-track 必须已经搬出 ~/hedge-bot -----------------------------------
-# 下面的 rsync --delete 会删掉 ~/hedge-bot 里不属于本仓的东西（src/perptrack 等）。perp-track 还在
+# --- 拆仓守卫：perp-track 不能在本部署目录里 -----------------------------------
+# 下面的 rsync --delete 会删掉部署目录里不属于本仓的东西（src/perptrack 等）。perp-track 还在
 # 这里跑的话，它的定时任务下一轮就找不到代码 —— 保证金监控静默停掉。所以先确认它已在 ~/perp-track。
 echo "==> perp-track 是否已搬出 ~/$REMOTE_DIR"
 if ! ssh "$TARGET" bash -s -- "$REMOTE_DIR" <<'REMOTE'
