@@ -118,6 +118,7 @@ def static_scan(cfg: Config, symbols: list[str], funding_db: Path | None,
             "fixed_fee_bp": fixed_fee_bp(cfg, per_contract),
             "exit_usd": exit_usd,
             "exit_impact_bp": walk_bp(pb.asks, exit_usd, pb.mid, cs),       # 买回空单
+            "exit_depth_usd": sum(px * sz * cs for px, sz in pb.asks if px <= pb.best_ask * (1 + 0.003)),
             "spot_exit_impact_bp": walk_bp(sb.bids, exit_usd, sb.mid),      # 现货挂单卖不完时
             "perp_adv_share": exit_usd / p["volume_24h_usd"] if p.get("volume_24h_usd") else None,
             "spot_adv_share": exit_usd / spot_vol if spot_vol else None,
@@ -130,6 +131,12 @@ def static_scan(cfg: Config, symbols: list[str], funding_db: Path | None,
             row["flags"].append(f"CDE 卖盘吃不完 {k} 出场")
         elif row["exit_impact_bp"] > lv.max_exit_impact_bp:
             row["flags"].append(f"{k} 出场冲击 {row['exit_impact_bp']:.0f}bp")
+        depth = row["exit_depth_usd"]
+        row["depth_share"] = exit_usd / depth if depth else None
+        if row["depth_share"] is None:
+            row["flags"].append("CDE 卖盘 30bp 内没有深度")
+        elif row["depth_share"] > lv.max_depth_share:
+            row["flags"].append(f"{k} 出场占 CDE 卖盘 30bp 深度 {row['depth_share']:.0%}")
         for leg, key in (("CDE", "perp_adv_share"), ("现货", "spot_adv_share")):
             if row[key] is None:
                 row["flags"].append(f"{leg} 无 24h 成交额")

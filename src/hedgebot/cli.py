@@ -135,6 +135,7 @@ def cmd_scan(cfg, args) -> None:
              f"{r['spot_spread_bp']:.1f}", f"{r['perp_spread_bp']:.1f}",
              f"${r['perp_depth_usd'] / 1000:,.0f}K",
              "不够" if r["exit_impact_bp"] is None else f"{r['exit_impact_bp']:.1f}",
+             "—" if r.get("depth_share") is None else f"{r['depth_share']:.0%}",
              "—" if r["perp_adv_share"] is None else f"{r['perp_adv_share']:.2%}",
              "—" if r["spot_adv_share"] is None else f"{r['spot_adv_share']:.2%}",
              f"{r['fixed_fee_bp']:.1f}", f"{r['basis_bp']:+.1f}",
@@ -144,13 +145,14 @@ def cmd_scan(cfg, args) -> None:
              f"{r['cost_pct']:.2f}%", "—" if r["breakeven_d"] is None else f"{r['breakeven_d']:.1f}",
              f"${r['oi_usd'] / 1e6:,.1f}M", "，".join(r["flags"])] for r in ok],
            ["标的", "每张", "块张数", "现货价差bp", "CDE价差bp", "CDE深度30bp",
-            "出场冲击bp", "CDE参与率", "现货参与率", "固定费bp/边", "基差bp",
+            "出场冲击bp", "占簿深30bp", "CDE参与率", "现货参与率", "固定费bp/边", "基差bp",
             "费率当前", "24h均", "7d均", "空单保证金", "资本年化", "一轮成本", "回本天",
             "OI", "提示"])
     print("\n资本年化 = 24h 均费率 ÷ (1 + 空单隔夜保证金率)：现货全额 + 空单保证金都算占用。")
     ex = ok[0]["exit_usd"] if ok else cfg.live.exit_usd
     print(f"容量按【出场 ${ex:,.0f}】算（--exit-usd 改）：出场冲击 = 一口气买回这么多空单，CDE 卖盘成交均价比中价贵多少；"
-          f"参与率 = 出场额 ÷ 24h 成交额（上限 {cfg.live.max_adv_share:.0%}）。"
+          f"占簿深 = 出场额 ÷ CDE 卖盘 30bp 内深度（主门槛 {cfg.live.max_depth_share:.0%}）；"
+          f"参与率 = 出场额 ÷ 24h 成交额（兜底 {cfg.live.max_adv_share:.0%}）。"
           f"固定费 = ${cfg.fees.cde_per_contract:g}/张 折成 bp/边，超过 {cfg.live.max_fixed_fee_bp:g}bp 拒绝开仓。")
     skipped: dict[str, list[str]] = {}
     for r in rows:
