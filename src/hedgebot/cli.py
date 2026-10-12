@@ -566,6 +566,13 @@ def cmd_paper(cfg, args) -> None:
                    ["标的", "开仓", "平仓", "价格盈亏", "手续费", "资金费", "净"])
 
 
+def cmd_grid_only(cfg, args) -> None:
+    """grid_only 的唯一主人是 hedge-bot 的 config.toml；perp-track 拆仓后经这个命令读它。"""
+    import json
+    names = sorted(cfg.grid_only)
+    print(json.dumps(names) if args.json else " ".join(names))
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="hedge", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -604,6 +611,8 @@ def main(argv=None) -> None:
     sc.add_argument("--paper", action="store_true", help="逐个模拟实跑开+平")
     sc.add_argument("--max-wait", type=float, default=90)
     sc.add_argument("--exit-usd", type=float, help="容量按多大的出场算（默认 config [live] exit_usd）")
+    go = sub.add_parser("grid-only", help="网格实盘管的合约名单（perp-track 经子进程读它）")
+    go.add_argument("--json", action="store_true", help="输出 JSON 数组")
     fu = sub.add_parser("funding", help="CDE 资金费排行（默认只列均值为负的）")
     fu.add_argument("--sign", choices=["neg", "pos", "all"], default="neg")
     fu.add_argument("--min-oi", type=float, default=0, help="OI 下限（美元）")
@@ -646,6 +655,7 @@ def main(argv=None) -> None:
     cfg = load_config()
     {"market": cmd_market, "account": cmd_account, "watch": cmd_watch, "scan": cmd_scan,
      "funding": cmd_funding,
+     "grid-only": cmd_grid_only,
      "live": lambda c, a: __import__("hedgebot.live", fromlist=["execute"]).execute(c, a),
      "rh-keygen": cmd_rh_keygen, "rh-order": cmd_rh_order, "import-cb-key": cmd_import_cb_key,
      "paper": cmd_paper,

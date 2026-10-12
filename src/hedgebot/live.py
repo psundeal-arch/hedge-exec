@@ -14,6 +14,7 @@ import os
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 from . import coinbase
 from .config import PROJECT_ROOT, Config, load_env
@@ -160,6 +161,17 @@ def leftover_orders(spot, warns: list) -> list[str]:
             for o in left]
 
 
+def perp_track_bin() -> str:
+    """perp-track 命令的位置：环境变量 PERP_TRACK_BIN > 与本 Python 同目录 > PATH。
+    拆仓后 perp-track 在自己的 venv 里，用 PERP_TRACK_BIN 指过去。"""
+    import shutil
+    import sys
+    if os.environ.get("PERP_TRACK_BIN"):
+        return os.environ["PERP_TRACK_BIN"]
+    sib = Path(sys.executable).with_name("perp-track")
+    return str(sib) if sib.exists() else (shutil.which("perp-track") or "perp-track")
+
+
 def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: float,
                 note: str, register: bool, ttl_s: float = 1800.0,
                 product_id: str = "", contracts: int = 0) -> tuple[str | None, str]:
@@ -176,23 +188,37 @@ def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: f
     给了 product_id + contracts 就让闸门用 Coinbase 自己 orders/preview 的 projected_margin_ratio
     （比手算折算准：11 张 HEP 手算 55.5%、CB 57.2%）；spend_cash 照传 —— preview 不知道要花现金买现货。
 
-    返回 (阻断原因或 None, 一行说明)。【取数失败一律拦】（fail-closed）。"""
+    返回 (阻断原因或 None, 一行说明)。【取数失败一律拦】（fail-closed）。
+
+    走 `perp-track gate` 子进程，不 import perptrack（拆仓：能下单的代码不依赖只读监控的包）。
+    契约：退出码 0 = 放行 / 1 = 拦，stdout 是 Gate 的 JSON；其它退出码、超时、找不到命令、
+    JSON 解析不了 —— 都是【闸门出错】，同样不放行。两类别混：1 是正常的拦，别当故障报。
+    register=False → --no-intent（真的不登记；原来 import 方式下只要带 source 就会登记）。"""
+    import json as _json
+    import subprocess
+    from types import SimpleNamespace
+    cmd = [perp_track_bin(), "gate", "--add-notional", f"{add_notional}", "--spend-cash", f"{spend_cash}",
+           "--source", "hedge-bot", "--note", note, "--ttl", f"{ttl_s:g}"]
+    if margin_rate is not None:                               # None 要省略，不能传字符串 "None"
+        cmd += ["--margin-rate", f"{margin_rate}"]
+    if product_id and contracts > 0:
+        cmd += ["--product-id", product_id, "--base-size", str(int(contracts)), "--side", "SELL"]
+    if not register:
+        cmd.append("--no-intent")
     try:
-        from perptrack import config as pt_config
-        from perptrack import gate
-        from perptrack.store import Store
-        pcfg = pt_config.load_config()
-        kw = dict(add_notional=add_notional, margin_rate=margin_rate, spend_cash=spend_cash,
-                  source="hedge-bot", note=note, ttl_s=ttl_s)
-        if product_id and contracts > 0:
-            kw |= dict(product_id=product_id, base_size=str(int(contracts)), side="SELL")
-        if register:
-            with Store() as st:
-                g = gate.check(pcfg, store=st, **kw)
-        else:
-            g = gate.check(pcfg, **kw)
-    except Exception as e:                                    # noqa: BLE001 —— 闸门坏了就不放行
+        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
         return f"保证金闸门出错，不放行：{type(e).__name__}: {e}", ""
+    if cp.returncode not in (0, 1):
+        tail = (cp.stderr or cp.stdout or "").strip().splitlines()[-1:] or [""]
+        return f"保证金闸门出错（退出码 {cp.returncode}），不放行：{tail[0][:200]}", ""
+    try:
+        g = SimpleNamespace(**_json.loads(cp.stdout))
+        g.ok = bool(g.ok)
+    except (ValueError, TypeError) as e:
+        return f"保证金闸门出错（输出不是 JSON），不放行：{e}", ""
+    if g.ok != (cp.returncode == 0):                          # 两个信号对不上就当出错，不猜
+        return f"保证金闸门出错（退出码 {cp.returncode} 与 ok={g.ok} 不一致），不放行", ""
     info = (f"保证金率（App 口径）{g.ratio_now:.1%} → 成交后 {g.ratio_after:.1%}，线 {g.limit:.0%}"
             if g.ratio_now is not None and g.ratio_after is not None else "")
     if g.ok and (g.reason or "").startswith("⚠"):

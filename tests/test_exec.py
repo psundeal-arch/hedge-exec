@@ -626,38 +626,69 @@ def test_gate_skipped_for_paper_and_non_coinbase_spot_buy():
     assert not asked
 
 
-def test_margin_gate_fails_closed(monkeypatch):
-    """闸门自己出错（取不到保证金、配置坏了）→ 不放行。"""
+def _fake_gate(monkeypatch, *, rc=0, out=None, raise_=None):
+    """替身 subprocess.run：记下命令行，按给定退出码 / stdout 回。"""
+    import json as _json
+    import subprocess
     from hedgebot import live
-    import perptrack.gate as g
-    monkeypatch.setattr(g, "check", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("CFM 502")))
-    why, _ = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=False)
-    assert why and "不放行" in why
+    seen = []
+
+    def run(cmd, **k):
+        seen.append(cmd)
+        if raise_:
+            raise raise_
+        body = out if isinstance(out, str) else _json.dumps(out or {
+            "ok": rc == 0, "reason": "放行" if rc == 0 else "成交后 62% 越过 60% —— 拦住",
+            "ratio_now": 0.45, "ratio_after": 0.47 if rc == 0 else 0.62, "limit": 0.6})
+        return subprocess.CompletedProcess(cmd, rc, body, "")
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(live, "perp_track_bin", lambda: "perp-track")
+    return live, seen
+
+
+def test_margin_gate_pass_and_block_via_cli(monkeypatch):
+    """退出码 0 = 放行、1 = 正常的拦 —— 拦住时给出原因，不当成闸门故障。"""
+    live, _ = _fake_gate(monkeypatch, rc=0)
+    why, info = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=True)
+    assert why is None and "45.0% → 成交后 47.0%" in info
+    live, _ = _fake_gate(monkeypatch, rc=1)
+    why, _ = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=True)
+    assert why and "62%" in why and "出错" not in why
+
+
+def test_margin_gate_fails_closed(monkeypatch):
+    """闸门出错（找不到命令、超时、退出码不是 0/1、输出不是 JSON、信号对不上）→ 不放行。"""
+    import subprocess
+    cases = [dict(raise_=FileNotFoundError("perp-track")),
+             dict(raise_=subprocess.TimeoutExpired("perp-track", 60)),
+             dict(rc=2, out="Traceback ..."),
+             dict(rc=0, out="不是 JSON"),
+             dict(rc=0, out='{"ok": false, "reason": "x"}')]
+    for kw in cases:
+        live, _ = _fake_gate(monkeypatch, **kw)
+        why, _ = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=False)
+        assert why and "闸门出错" in why and "不放行" in why, (kw, why)
 
 
 def test_margin_gate_surfaces_intent_forward_failure(monkeypatch):
     """放行但登记没转发到采集机：不拦单，但那句 ⚠ 要出现在说明里，不能被吞掉。"""
-    import types
-    from hedgebot import live
-    import perptrack.gate as g
-    monkeypatch.setattr(g, "check", lambda *a, **k: types.SimpleNamespace(
-        ok=True, ratio_now=0.45, ratio_after=0.47, limit=0.60,
-        reason="⚠ 动仓登记没能写到采集机（rhserver）：ssh 超时。单子照放\n放行：成交后 47.00%"))
-    why, info = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=False)
+    live, _ = _fake_gate(monkeypatch, rc=0, out={
+        "ok": True, "ratio_now": 0.45, "ratio_after": 0.47, "limit": 0.60,
+        "reason": "⚠ 动仓登记没能写到采集机（rhserver）：ssh 超时。单子照放\n放行：成交后 47.00%"})
+    why, info = live.margin_gate(add_notional=1000, margin_rate=0.5, spend_cash=0, note="t", register=True)
     assert why is None and "⚠ 动仓登记没能写到采集机" in info
 
 
-def test_margin_gate_passes_contract_for_cb_projection(monkeypatch):
-    """有合约和张数就交给闸门用 Coinbase 的 projected_margin_ratio；Coinbase 买现货（0 张）不传。"""
-    import types
-    from hedgebot import live
-    import perptrack.gate as g
-    seen = []
-    monkeypatch.setattr(g, "check", lambda cfg, **k: seen.append(k) or types.SimpleNamespace(
-        ok=True, ratio_now=0.45, ratio_after=0.47, limit=0.6, reason="放行"))
+def test_margin_gate_cli_args(monkeypatch):
+    """合约和张数要传（用 Coinbase 的 projected_margin_ratio）；register=False 必须是 --no-intent；
+    margin_rate=None 要省略而不是传字符串 "None"。"""
+    live, seen = _fake_gate(monkeypatch, rc=0)
     live.margin_gate(add_notional=5000, margin_rate=0.6, spend_cash=5000, note="t", register=False,
                      product_id="HEP-20DEC30-CDE", contracts=11)
-    live.margin_gate(add_notional=0, margin_rate=0, spend_cash=100, note="t", register=False)
-    assert seen[0]["product_id"] == "HEP-20DEC30-CDE" and seen[0]["base_size"] == "11" and seen[0]["side"] == "SELL"
-    assert seen[0]["spend_cash"] == 5000, "preview 不知道买现货要花现金，spend_cash 照传"
-    assert "product_id" not in seen[1]
+    live.margin_gate(add_notional=0, margin_rate=None, spend_cash=100, note="t", register=True)
+    a, b = seen
+    assert a[a.index("--product-id") + 1] == "HEP-20DEC30-CDE" and a[a.index("--base-size") + 1] == "11"
+    assert a[a.index("--spend-cash") + 1] == "5000", "preview 不知道买现货要花现金，spend_cash 照传"
+    assert "--no-intent" in a and "--no-intent" not in b
+    assert "--margin-rate" not in b and "None" not in b
+    assert "--product-id" not in b
