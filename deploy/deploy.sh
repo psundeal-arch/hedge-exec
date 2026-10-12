@@ -111,7 +111,7 @@ rsync -az --delete --backup --backup-dir=".deploy-backup/$TS" \
   --exclude '__pycache__/' --exclude '*.egg-info/' --exclude 'data/' \
   --exclude '.env' --exclude '.env.*' --exclude '.remote/' \
   --exclude '.deployed/' --exclude '.deploy-backup/' \
-  --exclude 'perp.db' --exclude 'perp.db-*' --exclude 'rhearn.db*' \
+  --exclude 'perp.db' --exclude 'perp.db-*' --exclude 'perp.db.*' --exclude 'rhearn.db*' \
   --exclude 'snapshots/' --exclude 'cron.log' --exclude 'cron.err' --exclude 'uv.lock' \
   "$STAGE"/ "$TARGET:$REMOTE_DIR/"
 
