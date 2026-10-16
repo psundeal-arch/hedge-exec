@@ -187,9 +187,9 @@ def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: f
     """问 perp-track 的保证金闸门：这一单下完，账户保证金率（App 口径）会在哪。
 
     和「CDE 购买力」检查是【叠加】不是替换：购买力答「这一单下得了吗」，闸门答
-    「下完之后离 60% 传呼线还有多远」—— 购买力可以很充裕而比值已越线（网格据此停开新格）。
+    「下完之后会不会越过闸门线」（线由 perp-track 的 [perp] margin_ratio_max 定，10-16 起 70%，不跟时段）—— 购买力可以很充裕而比值已越线（网格据此停开新格）。
 
-    register=True 时放行会登记一条动仓意图，margin-watch 的速率规则在 TTL 内不判 —— 只在
+    register=True 时放行会登记一条动仓意图，80% 以下的传呼在 TTL 内都被压住（10-16 起传呼必须同时满足水位与速率，速率正是下单造成的） —— 只在
     真要下单时传（--go / exec worker），只看不下单别登记，否则白白压掉速率判定。
     注意：登记写进本机仓库根的 perp.db；只有在服务器上跑（exec worker）才是 margin-watch
     读的那个活库，本机 hedge live 的登记到不了服务器。
