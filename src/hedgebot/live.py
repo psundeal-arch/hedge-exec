@@ -191,8 +191,8 @@ def margin_gate(*, add_notional: float, margin_rate: float | None, spend_cash: f
 
     register=True 时放行会登记一条动仓意图，80% 以下的传呼在 TTL 内都被压住（10-16 起传呼必须同时满足水位与速率，速率正是下单造成的） —— 只在
     真要下单时传（--go / exec worker），只看不下单别登记，否则白白压掉速率判定。
-    注意：登记写进本机仓库根的 perp.db；只有在服务器上跑（exec worker）才是 margin-watch
-    读的那个活库，本机 hedge live 的登记到不了服务器。
+    登记由 perp-track gate 转发到采集机的活库（本机跑时走 ssh）；转发失败照样放行，但 reason 以 ⚠
+    开头，下面会把它印出来 —— 那一笔可能招来一次误传呼。
 
     给了 product_id + contracts 就让闸门用 Coinbase 自己 orders/preview 的 projected_margin_ratio
     （比手算折算准：11 张 HEP 手算 55.5%、CB 57.2%）；spend_cash 照传 —— preview 不知道要花现金买现货。
